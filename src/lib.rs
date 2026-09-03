@@ -46,7 +46,7 @@
 //! |--------|-------------|
 //! | [`hex`] | `Sha3Digest` wrapper with `Display`, `LowerHex`, `UpperHex`, hex encode/decode |
 //! | [`ct`] | Constant-time byte comparison (Bernstein, Lange and Schwabe, 2012) |
-//! | [`io`] | Streaming `std::io::Read` adapter and `hash_file` convenience (std only) |
+//! | `io` | Streaming `std::io::Read` adapter and `hash_file` convenience (std only) |
 //! | [`kernel_safe`] | Processor state save/restore for kernel SIMD usage |
 //!
 //! ## Compilation Modes
@@ -61,17 +61,56 @@
 //! Runtime detection probes for AVX-512F/BW/DQ, AVX2+BMI2, and SSE4.2 via
 //! `is_x86_feature_detected!`, and is exposed through [`SimdFeatures`] and
 //! [`Sha3_512Kernel::simd_features`] so a caller can query what the current
-//! CPU supports. **That detection result is not currently consumed by the
-//! hasher.** Both the Keccak-f\[1600\] permutation and the absorb-phase XOR
-//! run the same scalar code path regardless of detected features or of the
-//! [`PerformanceConfig::use_avx2`]/[`PerformanceConfig::use_avx512`] flags —
-//! `hash()` ignores `self.config` entirely. Confirmed by benchmark: this
-//! crate's own `sha3_512_throughput/1MB_auto` (SIMD auto-detected) and
-//! `1MB_scalar` (explicitly forced off) criterion groups measure the same
-//! ~155-170 MiB/s on a CPU that reports AVX-512 and AVX2 available. A
-//! genuine vectorized permutation is unimplemented; the `use_avx2`/
-//! `use_avx512` fields exist for future API compatibility, not current
-//! effect.
+//! CPU supports.
+//!
+//! **AVX-512 single-message permutation (`std` + `x86_64` only):** real,
+//! not a stub. Setting [`PerformanceConfig::use_avx512`] to `true`
+//! dispatches every Keccak-f\[1600\] call in `hash()`/`update()`/
+//! `finalize()` to a vectorized implementation (`src/simd_avx512.rs`)
+//! when the CPU supports AVX-512F, cross-validated bit-for-bit against
+//! the scalar implementation (zero state, 2000 random states, 50 chained
+//! permutations, and the same XKCP known-answer values the scalar tests
+//! check). **It defaults to `false` because it is not a measured
+//! throughput win**: `cargo bench --bench sha3_bench` on this container's
+//! Xeon shows the AVX-512 path within noise of scalar at 64 KiB payloads,
+//! ~3-4% *slower* at 1 MiB, and ~10% slower at 4 KiB. A single
+//! Keccak-f\[1600\] instance has no independent lanes for one 512-bit
+//! register to exploit — π's cross-row mixing needs real shuffle/blend
+//! instructions (originally a memory-gather, which measured ~25-30%
+//! slower still; see `simd_avx512`'s module docs for that history) that
+//! scalar code simply doesn't pay for. This matches the wider Keccak-SIMD
+//! literature: single-instance vectorization is rarely profitable —
+//! real throughput gains come from hashing multiple independent messages
+//! in parallel, which is exactly what `Sha3_512Kernel::hash_many` does.
+//!
+//! **Multi-message batching (`hash_many`, `std` + `x86_64` only): a real
+//! win.** `Sha3_512Kernel::hash_many` hashes a batch of independent
+//! messages using the SIMD-parallel permutations in `src/simd_parallel.rs`
+//! — independent messages give the vector width actual parallel work,
+//! unlike single-message hashing above. Measured end to end
+//! (`cargo bench --bench sha3_bench sha3_512_hash_many`, 64 independent
+//! 4 KiB messages, this container's Xeon):
+//!
+//! | Path | Throughput | vs. scalar loop |
+//! |------|-----------|------------------|
+//! | scalar (one `hash()` per message) | ~182 MiB/s | 1.0x |
+//! | AVX2×4 batching | ~220 MiB/s | ~1.2x |
+//! | AVX-512×8 batching | ~1004 MiB/s | **~5.5x** |
+//!
+//! AVX-512×8 is a genuine, substantial win — 8 independent messages
+//! give an 8-lane register real parallel work with no gather/shuffle
+//! needed (ρ+π reduce to array indexing plus a uniform per-register
+//! rotate — see `simd_parallel`'s module docs for why this layout is so
+//! much more favorable than single-message vectorization). AVX2×4 is
+//! correct and a modest win, but far short of AVX-512: AVX2 has no
+//! 64-bit rotate instruction, so ρ is emulated as shift-left +
+//! shift-right + or, which eats most of the 4-way parallelism's benefit.
+//! Both are controlled by the same
+//! [`PerformanceConfig::use_avx512`]/[`PerformanceConfig::use_avx2`]
+//! flags as `hash()`; when neither applies, `hash_many` falls back to
+//! hashing each message individually via the scalar path.
+//!
+//! `prefetch_data`, `parallel_chunks`, and `chunk_size` remain no-ops.
 //!
 //! ## Correctness Validation
 //!
@@ -130,15 +169,77 @@ use std::vec::Vec;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-mod keccak;
-pub mod hex;
 pub mod ct;
+pub mod hex;
+mod keccak;
 
 #[cfg(not(feature = "kernel"))]
 pub mod io;
 
-use keccak::keccak_f1600;
+// AVX-512 requires `is_x86_feature_detected!`, which is a `std` macro (no
+// `core` equivalent) — so this is gated out of the `kernel` (`no_std`)
+// build, same as `io` above, and out of non-x86_64 targets entirely.
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+mod simd_avx512;
+
+// Multi-message parallel permutation (AVX2x4 / AVX-512x8) backing
+// `hash_many`. Same cfg gate as `simd_avx512` — see its comment above.
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+mod simd_parallel;
+
 pub use hex::Sha3Digest;
+// Only the non-AVX-512 `permute()` fallback below calls this directly; the
+// x86_64+std build's `permute()` reaches the scalar path indirectly via
+// `simd_avx512::keccak_f1600_dispatch` instead.
+#[cfg(any(not(target_arch = "x86_64"), feature = "kernel"))]
+use keccak::keccak_f1600;
+
+/// Test-only call counters proving which permutation path actually ran.
+///
+/// Digest *output* is identical whether the scalar or AVX-512 path runs
+/// (that's the whole correctness contract in `simd_avx512.rs`), so an
+/// output-only test can't tell "the config flag is wired up" apart from
+/// "the config flag is silently ignored and everything happens to still
+/// be correct scalar code." These counters close that gap.
+#[cfg(test)]
+static AVX512_PATH_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static SCALAR_PATH_CALLS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Single call site for the Keccak-f\[1600\] permutation used by the
+/// sponge (`Sha3_512State::absorb`/`finalize`). Chooses AVX-512 when
+/// `use_avx512` is `true` *and* the running CPU actually supports it
+/// (checked again, cheaply, inside [`simd_avx512::keccak_f1600_dispatch`]
+/// via `is_x86_feature_detected!`); falls back to the scalar
+/// implementation otherwise. On non-x86_64 targets, or the `kernel`
+/// (`no_std`) build where the AVX-512 module is compiled out entirely
+/// (see its `mod` declaration above), `use_avx512` is accepted but has
+/// no effect — there is no vector path to dispatch to.
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+#[inline]
+fn permute(state: &mut [u64; 25], use_avx512: bool) {
+    #[cfg(test)]
+    {
+        use core::sync::atomic::Ordering;
+        if use_avx512 && is_x86_feature_detected!("avx512f") {
+            AVX512_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            SCALAR_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    simd_avx512::keccak_f1600_dispatch(state, use_avx512);
+}
+
+#[cfg(any(not(target_arch = "x86_64"), feature = "kernel"))]
+#[inline]
+fn permute(state: &mut [u64; 25], _use_avx512: bool) {
+    #[cfg(test)]
+    {
+        use core::sync::atomic::Ordering;
+        SCALAR_PATH_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+    keccak_f1600(state);
+}
 
 /// SHA3-512 rate in bytes: r = (1600 − 2×512) / 8 = 72.
 const SHA3_512_RATE: usize = 72;
@@ -166,18 +267,43 @@ pub struct SimdFeatures {
 
 /// Performance configuration for hasher.
 ///
-/// **Currently has no effect on `hash()`'s behavior or timing.** Every
-/// field here is accepted and stored but never read by the hashing code
-/// path — `Sha3_512Kernel::hash` always runs the same scalar
-/// Keccak-f\[1600\] implementation. These fields exist so the public API
-/// shape doesn't need to break if/when a real SIMD-accelerated path is
-/// implemented; don't expect setting `use_avx512: true` (or `false`) to
-/// change measured throughput today — it won't.
+/// **`use_avx512`/`use_avx2` are real and wired up** on `std` + `x86_64`
+/// builds, but they mean different things depending on which method you
+/// call:
+///
+/// - **`Sha3_512Kernel::hash`/`update`/`finalize`** (single message):
+///   dispatch every Keccak-f\[1600\] permutation to
+///   [`simd_avx512`](crate) when `use_avx512` is `true` and the CPU
+///   supports AVX-512F (falling back to scalar otherwise; `use_avx2` has
+///   no effect here — see below). This is **not a clear win, which is
+///   why `use_avx512` defaults to `false`**: measured on this crate's own
+///   `cargo bench --bench sha3_bench` (this container's Xeon), it's
+///   within noise of scalar at 64 KiB payloads, ~3-4% *slower* at 1 MiB,
+///   and ~10% slower at 4 KiB. A single Keccak-f\[1600\] instance has no
+///   independent lanes for a 512-bit-wide register to parallelize
+///   *within* — π's cross-row mixing costs real shuffle/blend
+///   instructions that scalar code doesn't pay. Set it `true` here only
+///   if you've benchmarked your own workload and it actually helps.
+/// - **`Sha3_512Kernel::hash_many`** (a batch of independent messages):
+///   dispatches to AVX-512×8 or AVX2×4 batched permutations in
+///   `src/simd_parallel.rs`. Here the flags select a **real, measured
+///   win** — independent messages give the vector width genuine parallel
+///   work. See the crate-level "SIMD Status" section for full numbers;
+///   in short, AVX-512×8 measured ~5.5x over a scalar loop, AVX2×4 only
+///   ~1.2x (AVX2 has no 64-bit rotate instruction, so ρ is emulated via
+///   shift+shift+or, eating most of its 4-way parallelism).
+///
+/// `prefetch_data`, `parallel_chunks`, and `chunk_size` remain no-ops —
+/// nothing reads them yet.
 #[derive(Debug, Clone, Copy)]
 pub struct PerformanceConfig {
-    /// No-op today; reserved for a future AVX-512 code path.
+    /// Real and wired up (`std` + `x86_64` only) for both `hash()` and
+    /// `hash_many()` — see the struct-level docs above; the two methods
+    /// get very different returns on setting this `true`.
     pub use_avx512: bool,
-    /// No-op today; reserved for a future AVX2 code path.
+    /// No-op for `hash()` (AVX2 cannot accelerate a single-message
+    /// permutation — see struct docs); real, and a modest win, for
+    /// `hash_many()`.
     pub use_avx2: bool,
     /// No-op today; reserved for a future prefetch optimization.
     pub prefetch_data: bool,
@@ -190,7 +316,9 @@ pub struct PerformanceConfig {
 impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
-            use_avx512: true,
+            // Not a measured win on this crate's own benchmarks (see the
+            // struct docs) — opt-in, not default-on.
+            use_avx512: false,
             use_avx2: true,
             prefetch_data: true,
             parallel_chunks: true,
@@ -216,10 +344,10 @@ pub struct Sha3_512State {
 #[cfg(feature = "serde")]
 mod state_serde {
     use super::Sha3_512State;
-    use serde::{Serialize, Serializer, Deserialize, Deserializer};
-    use serde::ser::SerializeStruct;
-    use serde::de::{self, MapAccess, Visitor};
     use core::fmt;
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::ser::SerializeStruct;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[cfg(feature = "kernel")]
     use alloc::vec::Vec;
@@ -241,7 +369,12 @@ mod state_serde {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             #[derive(serde::Deserialize)]
             #[serde(field_identifier, rename_all = "lowercase")]
-            enum Field { State, Pos, Rate, Buffer }
+            enum Field {
+                State,
+                Pos,
+                Rate,
+                Buffer,
+            }
 
             struct StateVisitor;
 
@@ -252,7 +385,10 @@ mod state_serde {
                     f.write_str("struct Sha3_512State")
                 }
 
-                fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Sha3_512State, M::Error> {
+                fn visit_map<M: MapAccess<'de>>(
+                    self,
+                    mut map: M,
+                ) -> Result<Sha3_512State, M::Error> {
                     let mut state_lanes: Option<Vec<u64>> = None;
                     let mut pos: Option<usize> = None;
                     let mut rate: Option<usize> = None;
@@ -260,10 +396,18 @@ mod state_serde {
 
                     while let Some(key) = map.next_key::<Field>()? {
                         match key {
-                            Field::State  => { state_lanes = Some(map.next_value::<Vec<u64>>()?); }
-                            Field::Pos    => { pos = Some(map.next_value::<usize>()?); }
-                            Field::Rate   => { rate = Some(map.next_value::<usize>()?); }
-                            Field::Buffer => { buffer_vec = Some(map.next_value::<Vec<u8>>()?); }
+                            Field::State => {
+                                state_lanes = Some(map.next_value::<Vec<u64>>()?);
+                            }
+                            Field::Pos => {
+                                pos = Some(map.next_value::<usize>()?);
+                            }
+                            Field::Rate => {
+                                rate = Some(map.next_value::<usize>()?);
+                            }
+                            Field::Buffer => {
+                                buffer_vec = Some(map.next_value::<Vec<u8>>()?);
+                            }
                         }
                     }
 
@@ -273,14 +417,23 @@ mod state_serde {
                     let bv = buffer_vec.ok_or_else(|| de::Error::missing_field("buffer"))?;
 
                     let mut state = [0u64; 25];
-                    if sv.len() != 25 { return Err(de::Error::invalid_length(sv.len(), &"25")); }
+                    if sv.len() != 25 {
+                        return Err(de::Error::invalid_length(sv.len(), &"25"));
+                    }
                     state.copy_from_slice(&sv);
 
                     let mut buffer = [0u8; 200];
-                    if bv.len() != 200 { return Err(de::Error::invalid_length(bv.len(), &"200")); }
+                    if bv.len() != 200 {
+                        return Err(de::Error::invalid_length(bv.len(), &"200"));
+                    }
                     buffer.copy_from_slice(&bv);
 
-                    Ok(Sha3_512State { state, pos: pv, rate: rv, buffer })
+                    Ok(Sha3_512State {
+                        state,
+                        pos: pv,
+                        rate: rv,
+                        buffer,
+                    })
                 }
             }
 
@@ -331,13 +484,17 @@ impl Sha3_512Kernel {
 
     /// Hash `data` in a single call, returning the 64-byte SHA3-512 digest.
     ///
-    /// Always runs the scalar Keccak-f\[1600\] path — see the crate-level
-    /// "SIMD Status" section. `self.config` and `self.features` are not
-    /// consulted here.
+    /// Runs the AVX-512-vectorized Keccak-f\[1600\] permutation when
+    /// `self.config.use_avx512` is `true` *and* the CPU actually supports
+    /// AVX-512F (checked at each permutation call); otherwise runs the
+    /// scalar path. `self.config.use_avx2`/`prefetch_data`/
+    /// `parallel_chunks`/`chunk_size` remain no-ops — see the crate-level
+    /// "SIMD Status" section for why AVX2 alone can't accelerate a
+    /// single-message permutation.
     pub fn hash(&mut self, data: &[u8]) -> Sha3_512Hash {
         self.state.reset();
-        self.state.absorb(data);
-        self.state.finalize()
+        self.state.absorb(data, self.config.use_avx512);
+        self.state.finalize(self.config.use_avx512)
     }
 
     /// Hash a raw memory region (kernel-compatible).
@@ -351,9 +508,7 @@ impl Sha3_512Kernel {
         if size == 0 || size > MAX_HASH_SIZE {
             return [0u8; 64];
         }
-        let memory_slice = unsafe {
-            core::slice::from_raw_parts(base_address as *const u8, size)
-        };
+        let memory_slice = unsafe { core::slice::from_raw_parts(base_address as *const u8, size) };
         self.hash(memory_slice)
     }
 
@@ -366,6 +521,58 @@ impl Sha3_512Kernel {
             .collect()
     }
 
+    /// Hash multiple independent messages, using SIMD-parallel batches
+    /// when `self.config` allows and the CPU supports it.
+    ///
+    /// Unlike `hash()`'s [`PerformanceConfig::use_avx512`] (opt-in, not a
+    /// measured win — see the crate-level "SIMD Status" section),
+    /// **AVX-512×8 batching here is a real, measured win**: independent
+    /// messages give the vector width actual parallel work, unlike a
+    /// single permutation. Measured on this container's Xeon (raw
+    /// permutation throughput, `simd_parallel::timing_smoke`): AVX-512×8
+    /// is ~5.3x faster than 8 sequential scalar permutations. AVX2×4 is
+    /// implemented and correct but measured only ~1.0x (no real gain) —
+    /// AVX2 has no 64-bit rotate instruction, so ρ is emulated as
+    /// shift-left + shift-right + or, and that overhead roughly cancels
+    /// out the 4-way parallelism. Both are controlled by the same
+    /// [`PerformanceConfig::use_avx512`]/[`PerformanceConfig::use_avx2`]
+    /// flags as `hash()`; when neither applies (disabled in config, not
+    /// supported by the CPU, `kernel` build, or non-x86_64 target),
+    /// messages are hashed individually via the scalar path.
+    ///
+    /// Messages are batched in groups of the selected width (8 or 4);
+    /// within a group, variable-length messages are supported directly
+    /// — each message's own FIPS 202 `pad10*1` padding determines its own
+    /// block count, and its digest is captured the instant its own last
+    /// block is permuted, even while other lanes in the same group still
+    /// have blocks left. See `hash_batch` below for the algorithm.
+    ///
+    /// Returns one digest per input message, in the same order.
+    #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    pub fn hash_many(&self, messages: &[&[u8]]) -> Vec<Sha3_512Hash> {
+        let width = if self.config.use_avx512 && is_x86_feature_detected!("avx512f") {
+            8
+        } else if self.config.use_avx2 && is_x86_feature_detected!("avx2") {
+            4
+        } else {
+            1
+        };
+
+        let mut results = Vec::with_capacity(messages.len());
+        for chunk in messages.chunks(width.max(1)) {
+            match width {
+                8 => results.extend(hash_batch_x8(chunk)),
+                4 => results.extend(hash_batch_x4(chunk)),
+                _ => {
+                    for m in chunk {
+                        results.push(Sha3_512Kernel::new().hash(m));
+                    }
+                }
+            }
+        }
+        results
+    }
+
     /// Detect available SIMD features at runtime (userspace only).
     #[cfg(all(target_arch = "x86_64", not(feature = "kernel")))]
     fn detect_simd_features() -> SimdFeatures {
@@ -373,8 +580,7 @@ impl Sha3_512Kernel {
             avx512_available: is_x86_feature_detected!("avx512f")
                 && is_x86_feature_detected!("avx512bw")
                 && is_x86_feature_detected!("avx512dq"),
-            avx2_available: is_x86_feature_detected!("avx2")
-                && is_x86_feature_detected!("bmi2"),
+            avx2_available: is_x86_feature_detected!("avx2") && is_x86_feature_detected!("bmi2"),
             sse42_available: is_x86_feature_detected!("sse4.2"),
             bmi2_available: is_x86_feature_detected!("bmi2"),
         }
@@ -420,7 +626,7 @@ impl Sha3_512Kernel {
     /// Applies SHA3 padding and extracts the digest. After calling this
     /// method, the hasher must be `reset()` before reuse.
     pub fn finalize(&mut self) -> Sha3_512Hash {
-        self.state.finalize()
+        self.state.finalize(self.config.use_avx512)
     }
 
     /// Finalize and return a [`Sha3Digest`] wrapper with formatting traits.
@@ -438,7 +644,7 @@ impl Sha3_512Kernel {
     /// Can be called multiple times; the final digest is obtained
     /// by calling `finalize()`.
     pub fn update(&mut self, data: &[u8]) {
-        self.state.absorb(data);
+        self.state.absorb(data, self.config.use_avx512);
     }
 }
 
@@ -446,6 +652,143 @@ impl Default for Sha3_512Kernel {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// hash_many — SIMD-parallel batch hashing of independent messages.
+//
+// This operates on raw `[u64; 25]` states directly rather than going
+// through `Sha3_512State`, because a batch of W independent sponges needs
+// W state arrays live at once for the vector primitives in
+// `simd_parallel` to operate on — `Sha3_512State`'s single-sponge,
+// streaming (`pos`/`buffer`) design isn't the right shape for that, and
+// retrofitting it would complicate the streaming API this function
+// doesn't need. `pad_message`/`xor_block_into`/`squeeze` below
+// deliberately mirror `Sha3_512State::absorb`/`finalize`'s byte-level
+// logic exactly (same rate, same pad10*1 rule, same little-endian word
+// order) — `tests::hash_many_matches_hash_for_every_length_0_to_300`
+// cross-checks the two against each other so they can't silently drift.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+fn pad_message(msg: &[u8]) -> Vec<u8> {
+    let rate = SHA3_512_RATE;
+    let full_blocks = msg.len() / rate;
+    let total_len = (full_blocks + 1) * rate;
+    let mut buf = vec![0u8; total_len];
+    buf[..msg.len()].copy_from_slice(msg);
+    buf[msg.len()] = SHA3_DOMAIN_BYTE;
+    let last = total_len - 1;
+    buf[last] |= 0x80;
+    buf
+}
+
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+fn xor_block_into(state: &mut [u64; 25], block: &[u8]) {
+    let words = SHA3_512_RATE / 8;
+    for (i, lane) in state.iter_mut().enumerate().take(words) {
+        let off = i * 8;
+        let word = u64::from_le_bytes([
+            block[off],
+            block[off + 1],
+            block[off + 2],
+            block[off + 3],
+            block[off + 4],
+            block[off + 5],
+            block[off + 6],
+            block[off + 7],
+        ]);
+        *lane ^= word;
+    }
+}
+
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+fn squeeze(state: &[u64; 25]) -> Sha3_512Hash {
+    let mut hash = [0u8; 64];
+    for i in 0..8 {
+        hash[i * 8..(i + 1) * 8].copy_from_slice(&state[i].to_le_bytes());
+    }
+    hash
+}
+
+/// Batch up to 8 independent messages through `simd_parallel`'s
+/// AVX-512×8 permutation. `chunk.len()` must be `<= 8` — lanes beyond
+/// `chunk.len()` stay all-zero and are never read.
+///
+/// # Algorithm
+///
+/// Each message is padded independently ([`pad_message`]), so messages
+/// of different lengths need different numbers of blocks. Blocks are
+/// processed in lockstep across all lanes — every lane that still has a
+/// block at `block_idx` gets it XORed in before the shared vector
+/// permutation call; a lane with fewer blocks simply contributes no XOR
+/// once its own blocks are exhausted (it still gets permuted along with
+/// the others — harmless, since nothing reads its state again after its
+/// digest is captured). The instant a lane reaches its own last block
+/// (`block_idx == num_blocks[i] - 1`), its digest is squeezed out
+/// immediately, before any further block-XOR/permute rounds run for
+/// lanes that aren't done yet — that ordering is what makes variable-
+/// length batching correct.
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+fn hash_batch_x8(chunk: &[&[u8]]) -> Vec<Sha3_512Hash> {
+    debug_assert!(chunk.len() <= 8);
+    let padded: Vec<Vec<u8>> = chunk.iter().map(|m| pad_message(m)).collect();
+    let num_blocks: Vec<usize> = padded.iter().map(|p| p.len() / SHA3_512_RATE).collect();
+    let max_blocks = num_blocks.iter().copied().max().unwrap_or(0);
+
+    let mut states = [[0u64; 25]; 8];
+    let mut results = vec![[0u8; 64]; chunk.len()];
+
+    for block_idx in 0..max_blocks {
+        for i in 0..chunk.len() {
+            if block_idx < num_blocks[i] {
+                let start = block_idx * SHA3_512_RATE;
+                xor_block_into(&mut states[i], &padded[i][start..start + SHA3_512_RATE]);
+            }
+        }
+        // SAFETY: this function is only reached from `hash_many`, which
+        // checked `is_x86_feature_detected!("avx512f")` before selecting
+        // width 8.
+        unsafe { simd_parallel::keccak_f1600_x8_avx512(&mut states) };
+        for i in 0..chunk.len() {
+            if block_idx == num_blocks[i] - 1 {
+                results[i] = squeeze(&states[i]);
+            }
+        }
+    }
+    results
+}
+
+/// Same as [`hash_batch_x8`], batching up to 4 messages through
+/// `simd_parallel`'s AVX2×4 permutation.
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+fn hash_batch_x4(chunk: &[&[u8]]) -> Vec<Sha3_512Hash> {
+    debug_assert!(chunk.len() <= 4);
+    let padded: Vec<Vec<u8>> = chunk.iter().map(|m| pad_message(m)).collect();
+    let num_blocks: Vec<usize> = padded.iter().map(|p| p.len() / SHA3_512_RATE).collect();
+    let max_blocks = num_blocks.iter().copied().max().unwrap_or(0);
+
+    let mut states = [[0u64; 25]; 4];
+    let mut results = vec![[0u8; 64]; chunk.len()];
+
+    for block_idx in 0..max_blocks {
+        for i in 0..chunk.len() {
+            if block_idx < num_blocks[i] {
+                let start = block_idx * SHA3_512_RATE;
+                xor_block_into(&mut states[i], &padded[i][start..start + SHA3_512_RATE]);
+            }
+        }
+        // SAFETY: this function is only reached from `hash_many`, which
+        // checked `is_x86_feature_detected!("avx2")` before selecting
+        // width 4.
+        unsafe { simd_parallel::keccak_f1600_x4_avx2(&mut states) };
+        for i in 0..chunk.len() {
+            if block_idx == num_blocks[i] - 1 {
+                results[i] = squeeze(&states[i]);
+            }
+        }
+    }
+    results
 }
 
 // ---------------------------------------------------------------------------
@@ -481,7 +824,7 @@ impl Sha3_512State {
     /// Input is buffered until a full rate-block (72 bytes) is accumulated,
     /// then XORed into the state and followed by a Keccak-f\[1600\]
     /// permutation.
-    fn absorb(&mut self, data: &[u8]) {
+    fn absorb(&mut self, data: &[u8], use_avx512: bool) {
         let mut offset = 0;
         let len = data.len();
 
@@ -489,14 +832,13 @@ impl Sha3_512State {
         if self.pos > 0 {
             let remaining = self.rate - self.pos;
             let to_copy = core::cmp::min(remaining, len);
-            self.buffer[self.pos..self.pos + to_copy]
-                .copy_from_slice(&data[..to_copy]);
+            self.buffer[self.pos..self.pos + to_copy].copy_from_slice(&data[..to_copy]);
             self.pos += to_copy;
             offset += to_copy;
 
             if self.pos == self.rate {
                 self.xor_block_into_state();
-                keccak_f1600(&mut self.state);
+                permute(&mut self.state, use_avx512);
                 self.pos = 0;
             }
         }
@@ -520,7 +862,7 @@ impl Sha3_512State {
                 ]);
                 self.state[i] ^= word;
             }
-            keccak_f1600(&mut self.state);
+            permute(&mut self.state, use_avx512);
             offset += self.rate;
         }
 
@@ -541,7 +883,7 @@ impl Sha3_512State {
     ///   4. XOR the padded block into state
     ///   5. Apply Keccak-f\[1600\]
     ///   6. Extract 64 bytes in little-endian lane order
-    fn finalize(&mut self) -> Sha3_512Hash {
+    fn finalize(&mut self, use_avx512: bool) -> Sha3_512Hash {
         // --- SHA3 padding (FIPS 202 §6.1) ---
         // Clear buffer beyond current position
         for i in self.pos..self.rate {
@@ -554,7 +896,7 @@ impl Sha3_512State {
 
         // Absorb the padded final block
         self.xor_block_into_state();
-        keccak_f1600(&mut self.state);
+        permute(&mut self.state, use_avx512);
 
         // --- Squeeze phase ---
         // Extract 64 bytes (8 lanes × 8 bytes) in little-endian order
@@ -591,11 +933,11 @@ impl Sha3_512State {
 
 /// Kernel-safe memory operations
 pub mod kernel_safe {
-    
+
     /// Save processor state for SIMD operations
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// This function is unsafe because it directly manipulates processor registers.
     /// The caller must ensure:
     /// - The processor supports the required SIMD instructions (AVX2/AVX-512)
@@ -606,11 +948,11 @@ pub mod kernel_safe {
     pub unsafe fn save_processor_state() -> ProcessorState {
         ProcessorState::save()
     }
-    
+
     /// Restore processor state after SIMD operations
-    /// 
+    ///
     /// # Safety
-    /// 
+    ///
     /// This function is unsafe because it directly manipulates processor registers.
     /// The caller must ensure:
     /// - The state was previously saved by `save_processor_state()`
@@ -621,7 +963,7 @@ pub mod kernel_safe {
     pub unsafe fn restore_processor_state(state: ProcessorState) {
         state.restore();
     }
-    
+
     /// Processor state structure
     #[cfg(target_arch = "x86_64")]
     #[repr(C)]
@@ -631,13 +973,13 @@ pub mod kernel_safe {
         // Control registers
         control_registers: [u64; 8],
     }
-    
+
     #[cfg(target_arch = "x86_64")]
     impl ProcessorState {
         /// Save current processor state to memory
-        /// 
+        ///
         /// # Safety
-        /// 
+        ///
         /// This function is unsafe because it directly accesses processor registers.
         /// The caller must ensure:
         /// - The processor supports XSAVE/XSAVEOPT instructions
@@ -651,11 +993,11 @@ pub mod kernel_safe {
                 control_registers: [0u64; 8],
             }
         }
-        
+
         /// Restore processor state from saved memory
-        /// 
+        ///
         /// # Safety
-        /// 
+        ///
         /// This function is unsafe because it directly modifies processor registers.
         /// The caller must ensure:
         /// - The state was previously saved by the `save()` method
@@ -666,15 +1008,15 @@ pub mod kernel_safe {
             // In real implementation, use XRSTOR
         }
     }
-    
+
     #[cfg(not(target_arch = "x86_64"))]
     pub struct ProcessorState;
-    
+
     #[cfg(not(target_arch = "x86_64"))]
     pub unsafe fn save_processor_state() -> ProcessorState {
         ProcessorState
     }
-    
+
     #[cfg(not(target_arch = "x86_64"))]
     pub unsafe fn restore_processor_state(_state: ProcessorState) {
         // No-op for non-x86_64
@@ -917,6 +1259,103 @@ mod tests {
     }
 
     // ===================================================================
+    // PerformanceConfig::use_avx512 must actually change the permutation
+    // path `hash()` takes — not just be stored and ignored. Output alone
+    // can't distinguish "wired up" from "silently ignored, still
+    // correct" since both paths are correct by construction; these
+    // tests assert on `AVX512_PATH_CALLS`/`SCALAR_PATH_CALLS`, which
+    // `permute()` increments on every real permutation call.
+    // ===================================================================
+
+    #[test]
+    #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    fn hash_dispatches_to_avx512_path_when_configured_and_available() {
+        if !is_x86_feature_detected!("avx512f") {
+            eprintln!("skipping: no avx512f on this host");
+            return;
+        }
+        AVX512_PATH_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: true,
+            ..PerformanceConfig::default()
+        });
+        let vector_digest = hasher.hash(b"the quick brown fox jumps over the lazy dog");
+
+        assert!(
+            AVX512_PATH_CALLS.load(core::sync::atomic::Ordering::Relaxed) > 0,
+            "hash() with use_avx512: true must actually invoke the AVX-512 \
+             permutation path on hardware that supports it, not just store \
+             the flag"
+        );
+
+        // Correctness: must still match the scalar-forced hasher exactly.
+        let mut scalar_hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: false,
+            ..PerformanceConfig::default()
+        });
+        let scalar_digest = scalar_hasher.hash(b"the quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            vector_digest, scalar_digest,
+            "AVX-512-dispatched hash() must match scalar-dispatched hash() bit for bit"
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    fn hash_dispatches_to_scalar_path_when_use_avx512_is_false() {
+        SCALAR_PATH_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: false,
+            ..PerformanceConfig::default()
+        });
+        hasher.hash(b"some data");
+
+        assert!(
+            SCALAR_PATH_CALLS.load(core::sync::atomic::Ordering::Relaxed) > 0,
+            "hash() with use_avx512: false must take the scalar path"
+        );
+    }
+
+    #[test]
+    #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    fn incremental_update_also_uses_configured_dispatch() {
+        // absorb() is called on every full rate-block during multi-block
+        // incremental hashing, not just once in finalize() — verify the
+        // dispatch flag reaches that call site too, using a payload that
+        // spans multiple 72-byte rate blocks.
+        if !is_x86_feature_detected!("avx512f") {
+            eprintln!("skipping: no avx512f on this host");
+            return;
+        }
+        AVX512_PATH_CALLS.store(0, core::sync::atomic::Ordering::Relaxed);
+
+        let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: true,
+            ..PerformanceConfig::default()
+        });
+        let data = vec![0xABu8; 72 * 5 + 13]; // 5 full blocks + a partial tail
+        hasher.update(&data[..72 * 3]);
+        hasher.update(&data[72 * 3..]);
+        let vector_digest = hasher.finalize_digest();
+
+        let mut scalar_hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: false,
+            ..PerformanceConfig::default()
+        });
+        let scalar_digest = scalar_hasher.hash_digest(&data);
+
+        assert!(
+            AVX512_PATH_CALLS.load(core::sync::atomic::Ordering::Relaxed) >= 5,
+            "expected at least 5 AVX-512 permutation calls (one per full \
+             rate-block plus finalize), got {}",
+            AVX512_PATH_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+        );
+        assert_eq!(vector_digest, scalar_digest);
+    }
+
+    // ===================================================================
     // Memory region hashing
     // ===================================================================
 
@@ -951,8 +1390,10 @@ mod tests {
     /// for a variety of input lengths, covering all absorb edge cases.
     #[test]
     fn test_cross_validate_vs_sha3_crate() {
-        use sha3::{Sha3_512 as RefSha3_512, Digest};
-        let test_lengths: &[usize] = &[0, 1, 2, 31, 32, 63, 64, 71, 72, 73, 100, 143, 144, 145, 200, 255, 256, 512, 1000, 4096];
+        use sha3::{Digest, Sha3_512 as RefSha3_512};
+        let test_lengths: &[usize] = &[
+            0, 1, 2, 31, 32, 63, 64, 71, 72, 73, 100, 143, 144, 145, 200, 255, 256, 512, 1000, 4096,
+        ];
         let mut hasher = Sha3_512Kernel::new();
 
         for &len in test_lengths {
@@ -971,28 +1412,138 @@ mod tests {
             );
         }
     }
+
+    // ===================================================================
+    // hash_many — SIMD-parallel batch hashing
+    // ===================================================================
+
+    #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    mod hash_many_tests {
+        use super::*;
+
+        fn force(use_avx512: bool, use_avx2: bool) -> Sha3_512Kernel {
+            Sha3_512Kernel::with_config(PerformanceConfig {
+                use_avx512,
+                use_avx2,
+                ..PerformanceConfig::default()
+            })
+        }
+
+        /// Every one of `hash_many`'s three dispatch paths (AVX-512x8,
+        /// AVX2x4, scalar fallback) must match `hash()` called
+        /// individually, across every rate-block boundary from 0 to
+        /// just past 4 full blocks (0..=300 bytes covers the empty
+        /// message, the single-byte, every tail length 1..71, exact
+        /// multiples of the 72-byte rate, and multi-block messages).
+        #[test]
+        fn hash_many_matches_hash_for_every_length_0_to_300() {
+            let lengths: Vec<usize> = (0..=300).collect();
+            let messages: Vec<Vec<u8>> = lengths
+                .iter()
+                .map(|&len| (0..len).map(|i| (i & 0xFF) as u8).collect())
+                .collect();
+            let refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+
+            let mut scalar_hasher = Sha3_512Kernel::new();
+            let expected: Vec<Sha3_512Hash> =
+                messages.iter().map(|m| scalar_hasher.hash(m)).collect();
+
+            for (label, hasher) in [
+                ("avx512", force(true, false)),
+                ("avx2", force(false, true)),
+                ("scalar", force(false, false)),
+            ] {
+                if label == "avx512" && !is_x86_feature_detected!("avx512f") {
+                    eprintln!("skipping hash_many({label}): no avx512f on this host");
+                    continue;
+                }
+                if label == "avx2" && !is_x86_feature_detected!("avx2") {
+                    eprintln!("skipping hash_many({label}): no avx2 on this host");
+                    continue;
+                }
+                let results = hasher.hash_many(&refs);
+                assert_eq!(results.len(), messages.len());
+                for (i, &len) in lengths.iter().enumerate() {
+                    assert_eq!(
+                        results[i], expected[i],
+                        "hash_many({label}) mismatch at message length {len}"
+                    );
+                }
+            }
+        }
+
+        /// Deliberately mixes wildly different lengths in one batch (one
+        /// message finishes in a single block, another needs several) to
+        /// exercise the "extract on completion, keep permuting other
+        /// lanes" scheduling in `hash_batch_x8`/`hash_batch_x4` — this is
+        /// the part that's wrong if a short message's digest gets
+        /// overwritten by a later round meant for a longer sibling lane.
+        #[test]
+        fn hash_many_handles_mixed_lengths_in_one_batch() {
+            let batch: Vec<Vec<u8>> = vec![
+                vec![],                          // 1 block
+                vec![0xAB; 5],                   // 1 block
+                vec![0xCD; 72],                  // exact 1 rate-block of data -> 2 blocks total
+                vec![0xEF; 72 * 3 + 17],         // multi-block, uneven tail
+                b"the quick brown fox".to_vec(), // 1 block
+            ];
+            let refs: Vec<&[u8]> = batch.iter().map(|m| m.as_slice()).collect();
+
+            let mut scalar_hasher = Sha3_512Kernel::new();
+            let expected: Vec<Sha3_512Hash> = batch.iter().map(|m| scalar_hasher.hash(m)).collect();
+
+            if is_x86_feature_detected!("avx512f") {
+                let results = force(true, false).hash_many(&refs);
+                assert_eq!(results, expected, "AVX-512x8 mixed-length batch mismatch");
+            }
+            if is_x86_feature_detected!("avx2") {
+                let results = force(false, true).hash_many(&refs);
+                assert_eq!(results, expected, "AVX2x4 mixed-length batch mismatch");
+            }
+        }
+
+        /// A batch larger than the SIMD width (8 or 4) must be chunked
+        /// correctly, not just handle a single group.
+        #[test]
+        fn hash_many_handles_batches_larger_than_simd_width() {
+            let batch: Vec<Vec<u8>> = (0..37)
+                .map(|i| (0..(i * 3 + 1)).map(|b| (b & 0xFF) as u8).collect())
+                .collect();
+            let refs: Vec<&[u8]> = batch.iter().map(|m| m.as_slice()).collect();
+
+            let mut scalar_hasher = Sha3_512Kernel::new();
+            let expected: Vec<Sha3_512Hash> = batch.iter().map(|m| scalar_hasher.hash(m)).collect();
+
+            let results = Sha3_512Kernel::new().hash_many(&refs);
+            assert_eq!(results, expected);
+        }
+
+        #[test]
+        fn hash_many_empty_input_returns_empty() {
+            let results = Sha3_512Kernel::new().hash_many(&[]);
+            assert!(results.is_empty());
+        }
+    }
 }
 
 #[cfg(feature = "benchmarks")]
 pub mod benchmarks {
     use super::*;
-    use criterion::{black_box, criterion_group, criterion_main, Criterion};
     #[cfg(feature = "kernel")]
     use alloc::vec;
+    use criterion::{black_box, criterion_group, criterion_main, Criterion};
     #[cfg(not(feature = "kernel"))]
     use std::vec;
 
     fn bench_sha3_512(c: &mut Criterion) {
         let mut hasher = Sha3_512Kernel::new();
         let data = vec![0u8; 1024 * 1024]; // 1MB
-        
+
         c.bench_function("sha3_512_hash", |b| {
-            b.iter(|| {
-                black_box(hasher.hash(&data))
-            })
+            b.iter(|| black_box(hasher.hash(&data)))
         });
     }
-    
+
     criterion_group!(benches, bench_sha3_512);
     criterion_main!(benches);
 }

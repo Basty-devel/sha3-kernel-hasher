@@ -1,4 +1,4 @@
-# [RELEASE] sha3-kernel-hasher 0.2.0 — pure-Rust SHA3-512, no_std/kernel-mode dual build
+# [RELEASE] sha3-kernel-hasher 0.3.0 — pure-Rust SHA3-512, no_std/kernel-mode dual build
 
 Releasing a SHA3-512 (FIPS 202) implementation aimed at a gap I kept
 running into: most Rust SHA3 crates assume userspace `std`, and I needed
@@ -20,29 +20,42 @@ one that also builds `no_std` + `alloc` for a Windows kernel-mode driver.
   touching SIMD registers safely in a kernel context.
 - MIT OR Apache-2.0, PGP-signed releases (public key in the repo).
 
-## What it doesn't do (yet)
+## What SIMD actually does here
 
 Correcting my own earlier draft of this post here: I'd written up
 AVX-512/AVX2 throughput numbers and a "military-grade" pitch before
-actually confirming what the code does. It doesn't hold up, so here's
-what's real instead.
+actually confirming what the code does. Here's what's real, now that
+there's an actual SIMD implementation to measure instead of a stub.
 
 The crate detects AVX-512F/BW/DQ, AVX2+BMI2, and SSE4.2 at runtime and
-has a `PerformanceConfig` with `use_avx512`/`use_avx2` flags — but
-`hash()` doesn't read either. Every call runs the same scalar
-Keccak-f[1600] path. I benchmarked it properly instead of guessing:
+`PerformanceConfig`'s `use_avx512`/`use_avx2` flags are genuinely wired
+up — but they answer different questions depending on the call:
+
+**`hash()` (single message):** `use_avx512` dispatches to a real,
+cross-validated AVX-512 permutation — not a stub — but it's *not*
+faster:
 
 ```
-sha3_512_throughput/1MB_auto     [157.34 MiB/s 159.28 MiB/s 161.33 MiB/s]
-sha3_512_throughput/1MB_scalar   [163.80 MiB/s 167.20 MiB/s 170.87 MiB/s]
+sha3_512_throughput/1MB_scalar   [180.66 MiB/s 181.96 MiB/s 183.33 MiB/s]
+sha3_512_throughput/1MB_auto     [174.25 MiB/s 175.71 MiB/s 177.20 MiB/s]  (~3-4% slower)
 ```
 
-(`auto` = SIMD-detected config, `scalar` = both flags forced `false` —
-same code, same speed, on a CPU that reports both AVX-512 and AVX2
-available.) That's ~150-190 MiB/s across payload sizes from 64 B to
-1 MiB — a solid, correct scalar implementation, not an accelerated one.
+A single Keccak-f[1600] instance has no independent lanes for a 512-bit
+register to parallelize within, so it defaults to `false`.
+
+**`hash_many()` (a batch of independent messages):** here SIMD is a real
+win, because independent messages give the vector width genuine
+parallel work:
+
+```
+sha3_512_hash_many/64x4KiB_scalar_loop   [178.47 MiB/s 182.12 MiB/s 186.06 MiB/s]
+sha3_512_hash_many/64x4KiB_avx2          [217.39 MiB/s 219.85 MiB/s 222.88 MiB/s]  (~1.2x)
+sha3_512_hash_many/64x4KiB_avx512        [997.09 MiB/s 1004.4 MiB/s 1011.2 MiB/s]  (~5.5x)
+```
+
 No 2.5 GB/s, no OpenSSL comparison — I don't have a benchmark against
-OpenSSL in this repo, so I'm not going to claim one.
+OpenSSL in this repo, so I'm not going to claim one. ~1 GB/s on batched
+AVX-512 is the real, reproducible number.
 
 Also correcting: there's no completed external security audit and no
 formal FIPS 140/CMVP/Common Criteria certification. "Passes NIST's
@@ -53,7 +66,7 @@ would be a different, false claim.
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = "0.2.0"
+sha3-kernel-hasher = "0.3.0"
 ```
 
 ```rust
@@ -67,15 +80,15 @@ println!("SHA3-512: {:x}", hash);
 Kernel-mode build:
 
 ```toml
-sha3-kernel-hasher = { version = "0.2.0", default-features = false, features = ["kernel"] }
+sha3-kernel-hasher = { version = "0.3.0", default-features = false, features = ["kernel"] }
 ```
 
 ## What's next
 
-A real SIMD-widened permutation is the open item — that's the honest
-reason the `PerformanceConfig` fields exist at all, reserved for when
-that lands. Until then this is a tested, correct, dual-mode scalar
-SHA3-512, which is what I'm actually shipping today.
+Closing the small single-message AVX-512 gap, and a faster AVX2 rotate
+for batch hashing (AVX2 has no 64-bit rotate instruction, so it's
+currently emulated — see CONTRIBUTING.md) are the open performance
+items. A NEON (AArch64) path doesn't exist yet either.
 
 ## Links
 

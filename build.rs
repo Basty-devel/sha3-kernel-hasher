@@ -32,7 +32,11 @@ fn main() {
         println!("cargo:WDK_VERSION={}", version);
 
         if kernel_mode {
-            let arch = if target.contains("x86_64") { "x64" } else { "x86" };
+            let arch = if target.contains("x86_64") {
+                "x64"
+            } else {
+                "x86"
+            };
             let km_lib = root.join("Lib").join(&version).join("km").join(arch);
             if km_lib.exists() {
                 println!("cargo:rustc-link-search=native={}", km_lib.display());
@@ -54,7 +58,11 @@ fn detect_wdk() -> Option<(PathBuf, String)> {
             .ok()?
             .filter_map(|e| {
                 let name = e.ok()?.file_name().to_string_lossy().to_string();
-                if name.starts_with("10.") { Some(name) } else { None }
+                if name.starts_with("10.") {
+                    Some(name)
+                } else {
+                    None
+                }
             })
             .collect();
         versions.sort();

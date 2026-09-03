@@ -1,8 +1,8 @@
 //! Kernel-mode hashing example for SHA3-Kernel-Hasher
-//! 
+//!
 //! Demonstrates safe memory hashing in kernel environments
 
-use sha3_kernel_hasher::{Sha3_512Kernel, MemoryRegion, kernel_safe};
+use sha3_kernel_hasher::{kernel_safe, MemoryRegion, Sha3_512Kernel};
 
 fn hash_hex(h: &[u8; 64]) -> String {
     h.iter().map(|b| format!("{:02x}", b)).collect()
@@ -10,10 +10,10 @@ fn hash_hex(h: &[u8; 64]) -> String {
 
 fn main() {
     println!("🖥️ SHA3-Kernel-Hasher - Kernel Usage Example");
-    
+
     // Create hasher with kernel-optimized configuration
     let mut hasher = Sha3_512Kernel::new();
-    
+
     // Example memory regions (simulated kernel addresses)
     let regions = vec![
         MemoryRegion {
@@ -38,30 +38,37 @@ fn main() {
             is_executable: false,
         },
     ];
-    
+
     println!("🔍 Hashing {} memory regions...", regions.len());
-    
+
     // Safe kernel hashing with processor state management
     let hashes = unsafe {
         // Save processor state for SIMD operations
         let _saved_state = kernel_safe::save_processor_state();
-        
+
         // Hash each memory region
         let results = hasher.hash_memory_regions(&regions);
-        
+
         // Restore processor state
         kernel_safe::restore_processor_state(_saved_state);
-        
+
         results
     };
-    
+
     // Display results
     for (i, (region, hash)) in regions.iter().zip(hashes.iter()).enumerate() {
-        println!("Region {}: Address 0x{:x}, Size {}KB", i + 1, region.base_address, region.size / 1024);
-        println!("  Readable: {}, Writable: {}, Executable: {}", 
-                 region.is_readable, region.is_writable, region.is_executable);
+        println!(
+            "Region {}: Address 0x{:x}, Size {}KB",
+            i + 1,
+            region.base_address,
+            region.size / 1024
+        );
+        println!(
+            "  Readable: {}, Writable: {}, Executable: {}",
+            region.is_readable, region.is_writable, region.is_executable
+        );
         println!("  SHA3-512: {}", hash_hex(hash));
-        
+
         // Verify hash integrity
         if verify_hash_integrity(hash) {
             println!("  ✅ Hash integrity verified");
@@ -70,26 +77,26 @@ fn main() {
         }
         println!();
     }
-    
+
     // Demonstrate incremental hashing
     println!("🔄 Incremental Hashing Example:");
     let mut incremental_hasher = Sha3_512Kernel::new();
-    
+
     let data_chunks: Vec<&[u8]> = vec![
         b"First part of ",
         b"data to be hashed ",
         b"incrementally with ",
         b"SHA3-Kernel-Hasher",
     ];
-    
+
     for chunk in data_chunks {
         incremental_hasher.update(chunk);
         println!("  Updated with: {}", String::from_utf8_lossy(chunk));
     }
-    
+
     let final_hash = incremental_hasher.finalize();
     println!("  Final SHA3-512: {}", hash_hex(&final_hash));
-    
+
     // Timing demonstration — NOT a real SIMD comparison.
     //
     // `PerformanceConfig::use_avx2`/`use_avx512` are currently no-ops:
@@ -114,8 +121,16 @@ fn main() {
     let avx2_hash = avx2_hasher.hash(&performance_data);
     let avx2_time = avx2_start.elapsed();
 
-    println!("  Scalar (use_avx2: false): {:?} - {}", scalar_time, hash_hex(&scalar_hash));
-    println!("  use_avx2: true (same code path today): {:?} - {}", avx2_time, hash_hex(&avx2_hash));
+    println!(
+        "  Scalar (use_avx2: false): {:?} - {}",
+        scalar_time,
+        hash_hex(&scalar_hash)
+    );
+    println!(
+        "  use_avx2: true (same code path today): {:?} - {}",
+        avx2_time,
+        hash_hex(&avx2_hash)
+    );
     println!("  (Digests are identical: {})", scalar_hash == avx2_hash);
 
     println!("✅ Kernel example completed!");

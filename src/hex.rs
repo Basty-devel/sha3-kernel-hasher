@@ -55,9 +55,9 @@ pub struct Sha3Digest(pub [u8; 64]);
 #[cfg(feature = "serde")]
 mod digest_serde {
     use super::Sha3Digest;
-    use serde::{Serialize, Serializer, Deserialize, Deserializer};
-    use serde::de::{self, Visitor, SeqAccess};
     use core::fmt;
+    use serde::de::{self, SeqAccess, Visitor};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     impl Serialize for Sha3Digest {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -88,7 +88,8 @@ mod digest_serde {
                 fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Sha3Digest, A::Error> {
                     let mut buf = [0u8; 64];
                     for (i, slot) in buf.iter_mut().enumerate() {
-                        *slot = seq.next_element::<u8>()?
+                        *slot = seq
+                            .next_element::<u8>()?
                             .ok_or_else(|| de::Error::invalid_length(i, &"64"))?;
                     }
                     Ok(Sha3Digest(buf))

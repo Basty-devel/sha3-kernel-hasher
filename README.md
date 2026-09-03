@@ -107,8 +107,10 @@ SHA-2) and is therefore immune to length-extension attacks by design
 ```
 sha3-kernel-hasher/
 ├── src/
-│   ├── lib.rs          # Public API, sponge absorb/finalize, runtime SIMD *detection* (unused — §5.1)
-│   ├── keccak.rs       # Keccak-f[1600] permutation (24-round, all 5 steps)
+│   ├── lib.rs          # Public API, sponge absorb/finalize, hash_many batching, SIMD detection
+│   ├── keccak.rs       # Keccak-f[1600] permutation (24-round, all 5 steps) — scalar reference
+│   ├── simd_avx512.rs  # Single-message AVX-512 permutation (opt-in, not a measured win — §5.1)
+│   ├── simd_parallel.rs # Multi-message AVX-512x8 / AVX2x4 permutation (real win — §5.1)
 │   ├── hex.rs          # Sha3Digest wrapper, hex encoding/decoding, Display
 │   ├── ct.rs           # Constant-time comparison primitives
 │   └── io.rs           # Streaming I/O hashing (std::io::Read adapter)
@@ -131,20 +133,31 @@ The crate supports two compilation targets, controlled by Cargo features:
 | Userspace (default) | `std` | Yes | Yes | Applications, services, CLI tools |
 | Kernel | `kernel` | No | Yes | Windows kernel-mode drivers (WDM/KMDF) |
 
-In kernel mode, the `io` module is disabled (it depends on `std::io`).
+In kernel mode, the `io` module is disabled (it depends on `std::io`),
+and so are `simd_avx512`/`simd_parallel` (both need
+`is_x86_feature_detected!`, a `std`-only macro with no `core`
+equivalent) — kernel-mode hashing is always scalar.
 `kernel_safe::save_processor_state`/`restore_processor_state` exist for
 a driver that needs to touch SIMD registers around *its own* code
-safely (they wrap `KeSaveExtendedProcessorState`, Microsoft, 2023) — but
-this crate's own hashing code doesn't use SIMD in either mode; see §5.1.
+safely (they wrap `KeSaveExtendedProcessorState`, Microsoft, 2023).
 
 ### 2.3 SIMD Status
 
 Runtime SIMD detection probes for AVX-512F/BW/DQ, AVX2+BMI2, and
-SSE4.2 via `is_x86_feature_detected!` and is exposed for callers to query.
-**Nothing in this crate currently dispatches on that detection.** Both the
-absorb-phase XOR and the core Keccak-f[1600] permutation run the same
-scalar path unconditionally. See §5.1 for the benchmark that proves it
-and the measured throughput this actually gets you.
+SSE4.2 via `is_x86_feature_detected!` and is exposed for callers to query
+via `simd_features()`. On `std` + `x86_64` builds, two independent SIMD
+paths exist and are genuinely wired up — see §5.1 for full numbers:
+
+- **`hash()`/`update()`/`finalize()`** (single message): `use_avx512`
+  dispatches to a real AVX-512 permutation, but it's not a throughput
+  win on this crate's own benchmarks — defaults to `false`.
+- **`hash_many()`** (a batch of independent messages): `use_avx512`
+  dispatches to a real AVX-512×8 batched permutation that *is* a
+  substantial win (~5.5x); `use_avx2` gives a modest ~1.2x via an
+  AVX2×4 batched permutation.
+
+Read §5.1 before enabling `use_avx512` on the single-message path —
+"real" and "faster" are not the same claim here.
 
 ---
 
@@ -169,6 +182,28 @@ hasher.update(b"first ");
 hasher.update(b"second");
 let hash = hasher.finalize();
 ```
+
+Batch hashing of independent messages (`std` + `x86_64`), where the
+AVX-512×8 SIMD path is a real ~5.5x throughput win over a scalar loop
+(§5.1). Messages may have different lengths; digests come back in input
+order:
+
+```rust
+use sha3_kernel_hasher::{PerformanceConfig, Sha3_512Kernel};
+
+let hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+    use_avx512: true,
+    ..Default::default()
+});
+
+let messages: Vec<&[u8]> = vec![b"first", b"second", b"a much longer third message"];
+let digests = hasher.hash_many(&messages);
+assert_eq!(digests.len(), 3);
+```
+
+If the CPU lacks AVX-512 (or the flags are off), `hash_many` falls back
+to AVX2×4 batching, then to hashing each message individually — the
+output is identical either way.
 
 ### 3.2 `Sha3Digest` — Typed Hash Output (`hex` module)
 
@@ -240,19 +275,26 @@ Simple wall-clock throughput measurement for integration testing.
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = "0.2.0"
+sha3-kernel-hasher = "0.3.0"
 ```
 
 For kernel drivers:
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = { version = "0.2.0", default-features = false, features = ["kernel"] }
+sha3-kernel-hasher = { version = "0.3.0", default-features = false, features = ["kernel"] }
 ```
 
 ### 4.2 Minimum Supported Rust Version (MSRV)
 
-The crate requires **Rust 1.73** or later.
+The crate requires **Rust 1.89** or later — raised from 1.73 for the
+AVX-512 SIMD path (§5.1), which uses `_mm512_ternarylogic_epi64`,
+`_mm512_permutexvar_epi64`, `_mm512_rolv_epi64`, and
+`_mm512_i64gather_epi64`, all stabilized in Rust 1.89.0. The `kernel`
+(`no_std`) build does not include the AVX-512 module and has no
+additional MSRV requirement beyond the base 1.73 it always had, but the
+crate declares one `rust-version` for the whole package, so it now reads
+1.89 regardless of which features are enabled.
 
 ### 4.3 Running Tests
 
@@ -283,44 +325,73 @@ cargo run --example benchmark --release -p sha3-kernel-hasher
 | `serde` | No | `Serialize` / `Deserialize` derives for state and hash types |
 | `benchmarks` | No | Enables criterion benchmark harness integration |
 
-There is no `avx2`/`avx512` Cargo feature — see §5.1. `std` only turns on
-*detection* (`is_x86_feature_detected!`), not acceleration.
+There is no `avx2`/`avx512` Cargo feature — SIMD is runtime-dispatched
+(`is_x86_feature_detected!`) behind `PerformanceConfig`, not
+feature-gated. See §5.1 for what's actually accelerated.
 
 ### 5.1 Current SIMD status — read before depending on a performance claim
 
 `Sha3_512Kernel` detects AVX-512F/BW/DQ, AVX2+BMI2, and SSE4.2 at runtime
-(`simd_features()`), and its `PerformanceConfig` struct has `use_avx512`/
-`use_avx2` fields. **Neither is consumed by `hash()`.** The Keccak-f[1600]
-permutation and the absorb-phase XOR are pure scalar Rust in every case —
-grep `src/` yourself: there is no `#[cfg(feature = ...)]` or runtime
-branch on SIMD anywhere in the hot path. `PerformanceConfig` exists so the
-public API won't need to break if a real vectorized path is added later;
-today it's inert.
+(`simd_features()`). `PerformanceConfig`'s `use_avx512`/`use_avx2` fields
+are real and wired up on `std` + `x86_64` builds, but they answer two
+different questions depending on which method reads them:
 
-This crate's own `benches/sha3_bench.rs` proves it directly — the
-`sha3_512_throughput/1MB_auto` group (SIMD auto-detected) and
-`1MB_scalar` group (`use_avx512`/`use_avx2` explicitly forced `false`)
-measure the same throughput, because they run identical code:
+**Single-message (`hash()`/`update()`/`finalize()`) — not a win, off by
+default.** `use_avx512` dispatches every Keccak-f[1600] call to a real,
+cross-validated AVX-512 permutation (`src/simd_avx512.rs`) — this is not
+a stub, it passes 2000 random-state trials plus 50 chained permutations
+against the scalar implementation. It just isn't *faster*: a single
+Keccak-f[1600] instance has no independent lanes for a 512-bit register
+to parallelize within, and π's cross-row mixing costs real shuffle
+instructions scalar code doesn't pay. Measured via
+`cargo bench --bench sha3_bench sha3_512_throughput` (this container's
+Xeon):
 
 ```
-sha3_512_throughput/1MB_auto     [157.34 MiB/s 159.28 MiB/s 161.33 MiB/s]
-sha3_512_throughput/1MB_scalar   [163.80 MiB/s 167.20 MiB/s 170.87 MiB/s]
+sha3_512_throughput/1MB_scalar    [180.66 MiB/s 181.96 MiB/s 183.33 MiB/s]
+sha3_512_throughput/1MB_auto      [174.25 MiB/s 175.71 MiB/s 177.20 MiB/s]  (~3-4% slower)
 ```
 
-(Run on a CPU reporting AVX-512 and AVX2 both available — `cargo bench`
-to reproduce on your own hardware.) Single-hash throughput across payload
-sizes, measured via `cargo run --release --example benchmark`:
+`use_avx2` has no effect on this path at all — AVX2 has no per-lane
+*variable* 64-bit rotate instruction, which ρ needs; only AVX-512F
+provides one (`_mm512_rolv_epi64`). `use_avx512` therefore **defaults to
+`false`** here. Set it `true` only after benchmarking your own workload.
+
+**Batch (`hash_many()`) — a real win, still off by default pending your
+own benchmark.** Hashing a batch of *independent* messages gives the
+vector width genuine parallel work, unlike single-message hashing above:
+each SIMD lane holds a different message's state, so ρ+π reduce to array
+indexing plus a uniform (not gathered) rotate. Measured end to end
+(`cargo bench --bench sha3_bench sha3_512_hash_many`, 64 independent
+4 KiB messages):
+
+| Path | Throughput | vs. scalar loop |
+|------|-----------|------------------|
+| scalar (one `hash()` per message) | ~182 MiB/s | 1.0x |
+| AVX2×4 batching | ~220 MiB/s | ~1.2x |
+| AVX-512×8 batching | ~1004 MiB/s | **~5.5x** |
+
+AVX-512×8 is the real payoff. AVX2×4 is correct but modest — AVX2's
+missing 64-bit rotate is emulated as shift-left + shift-right + or,
+which eats most of the 4-way parallelism's benefit. Both flags still
+default to whatever `PerformanceConfig::default()` sets (`use_avx512:
+false`, `use_avx2: true`) — check your own workload's batch size and
+CPU before relying on either number.
+
+Single-hash throughput across payload sizes (scalar path), measured via
+`cargo run --release --example benchmark`:
 
 | Size | Throughput |
 |------|-----------|
 | 64 B | ~150-160 MiB/s |
 | 1 KiB | ~155-165 MiB/s |
-| 64 KiB | ~170-180 MiB/s |
-| 1 MiB | ~185-195 MiB/s |
+| 64 KiB | ~170-200 MiB/s |
+| 1 MiB | ~180-195 MiB/s |
 
-That's a correct, competent scalar Rust SHA3-512 — comparable to other
-pure-Rust scalar implementations — not a hardware-accelerated one. A real
-SIMD-widened permutation is an open item, not a shipped feature.
+That single-hash number is a correct, competent scalar Rust SHA3-512 —
+comparable to other pure-Rust scalar implementations. The real
+hardware-accelerated throughput this crate can deliver today is in
+`hash_many()`'s AVX-512×8 batching, not single-message `hash()`.
 
 ---
 
@@ -408,14 +479,16 @@ crate (v0.10) for 20 input lengths: 0, 1, 2, 31, 32, 63, 64, 71, 72
 
 | Architecture | Code path actually run | Notes |
 |-------------|------------------------|-------|
-| x86_64 | Scalar (always) | AVX-512F/BW/DQ, AVX2+BMI2, and SSE4.2 are *detected* at runtime (`simd_features()`) but not currently used — see §5.1 |
+| x86_64 (`std`) | Scalar by default; real AVX-512 (`hash()`) and AVX-512×8/AVX2×4 (`hash_many()`) available via `PerformanceConfig` | See §5.1 for which flag does what, and which is actually a throughput win |
+| x86_64 (`kernel`) | Scalar (always) | `is_x86_feature_detected!` is `std`-only; `simd_avx512`/`simd_parallel` are excluded from `no_std` builds entirely |
 | x86 | Scalar (always) | 32-bit |
 | AArch64 | Scalar (always) | No NEON/SVE path implemented yet |
 | Other | Scalar (always) | Universal fallback |
 
-Every row runs the identical scalar implementation today, regardless of
-what the CPU supports. This table is about what's actually compiled and
-executed, not a roadmap of intended tiers — see §5.1 for that.
+Every row runs scalar Rust by default. On `std` + `x86_64`, opting into
+`PerformanceConfig::use_avx512`/`use_avx2` changes what actually runs —
+see §5.1 for exactly which combinations are real speedups versus
+correct-but-not-faster.
 
 ### 8.3 Benchmarking
 

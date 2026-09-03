@@ -88,8 +88,7 @@ fn main() {
     let digest_stream = reader.finalize();
     let elapsed_stream = t0.elapsed();
 
-    let throughput_stream =
-        (bytes_read as f64) / elapsed_stream.as_secs_f64() / (1024.0 * 1024.0);
+    let throughput_stream = (bytes_read as f64) / elapsed_stream.as_secs_f64() / (1024.0 * 1024.0);
 
     println!("  Digest   : {}", digest_stream);
     println!("  Bytes    : {}", format_bytes(bytes_read as f64));
@@ -105,8 +104,7 @@ fn main() {
     let digest_conv = hash_reader(image2).expect("I/O error");
     let elapsed_conv = t1.elapsed();
 
-    let throughput_conv =
-        (IMAGE_SIZE as f64) / elapsed_conv.as_secs_f64() / (1024.0 * 1024.0);
+    let throughput_conv = (IMAGE_SIZE as f64) / elapsed_conv.as_secs_f64() / (1024.0 * 1024.0);
 
     println!("  Digest   : {}", digest_conv);
     println!("  Time     : {:.3} s", elapsed_conv.as_secs_f64());
@@ -122,7 +120,10 @@ fn main() {
     println!();
 
     // ── Test 3: Incremental update() with 64 KiB chunks ────────────
-    println!("[3/3] Incremental update() with {} KiB chunks...", GEN_CHUNK / 1024);
+    println!(
+        "[3/3] Incremental update() with {} KiB chunks...",
+        GEN_CHUNK / 1024
+    );
     let mut hasher = Sha3_512Kernel::new();
     let mut img3 = SyntheticImage::new(IMAGE_SIZE);
     let mut buf = vec![0u8; GEN_CHUNK];
@@ -138,8 +139,7 @@ fn main() {
     let digest_inc = hasher.finalize_digest();
     let elapsed_inc = t2.elapsed();
 
-    let throughput_inc =
-        (IMAGE_SIZE as f64) / elapsed_inc.as_secs_f64() / (1024.0 * 1024.0);
+    let throughput_inc = (IMAGE_SIZE as f64) / elapsed_inc.as_secs_f64() / (1024.0 * 1024.0);
 
     println!("  Digest   : {}", digest_inc);
     println!("  Time     : {:.3} s", elapsed_inc.as_secs_f64());
@@ -156,7 +156,8 @@ fn main() {
     // ── Summary ─────────────────────────────────────────────────────
     println!("=============================================================");
     println!("  PASS — All 3 methods produce identical SHA3-512 digests");
-    println!("  Best throughput: {:.1} MiB/s ({})",
+    println!(
+        "  Best throughput: {:.1} MiB/s ({})",
         throughput_stream.max(throughput_conv).max(throughput_inc),
         if throughput_stream >= throughput_conv && throughput_stream >= throughput_inc {
             "Sha3Reader"

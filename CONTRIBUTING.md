@@ -1,14 +1,17 @@
 # Contributing to sha3-kernel-hasher
 
 Contributions welcome. This is a pure-Rust SHA3-512 (FIPS 202) implementation
-with a `no_std` + `alloc` build mode for kernel drivers — see the README for
-what's actually implemented today (scalar only — no SIMD acceleration yet)
-before proposing a change.
+with a `no_std` + `alloc` build mode for kernel drivers, and real (not
+stubbed) AVX-512/AVX2 SIMD paths on `std` + `x86_64` — see README §5.1 for
+exactly which SIMD flag does what before proposing a change, since not
+all of them are throughput wins (single-message AVX-512 isn't; batch
+AVX-512×8 is a ~5.5x one).
 
 ## Getting started
 
 ### Prerequisites
-- Rust 1.73+, stable toolchain
+- Rust 1.89+, stable toolchain (raised from 1.73 for the AVX-512 SIMD
+  intrinsics in `src/simd_avx512.rs` — see README §4.2)
 - Familiarity with the FIPS 202 / Keccak sponge construction helps for
   anything touching `src/keccak.rs` or `src/lib.rs`'s absorb/squeeze code
 - Kernel-mode programming background if you're working on the `kernel`
@@ -24,15 +27,25 @@ cargo bench
 
 ## What's useful to contribute
 
-- **A real SIMD-accelerated Keccak-f[1600] permutation.** This is the
-  single most valuable contribution right now — `PerformanceConfig`'s
-  `use_avx2`/`use_avx512` fields exist specifically so a real
-  implementation can land without an API break. See README §5.1 for
-  exactly what's missing and how to verify a change actually accelerates
-  anything (the repo's own criterion benchmark is the test: a real
-  SIMD path should show a measurable throughput difference between the
-  `scalar` and `avx2`/`avx512` benchmark groups — today they're
-  statistically identical, which is the bug this would fix).
+- **Closing the single-message AVX-512 gap.** `hash()`'s AVX-512 path
+  (`src/simd_avx512.rs`) is correct but currently ~3-4% *slower* than
+  scalar at 1 MiB (README §5.1) — π's cross-row mixing pays for real
+  shuffle/blend instructions a single Keccak-f[1600] instance has no
+  independent lanes to amortize against. An implementation that closes
+  or reverses that gap (without breaking any of the module's existing
+  cross-validation tests) would be genuinely valuable. The repo's own
+  criterion benchmark is the test: run
+  `cargo bench --bench sha3_bench sha3_512_throughput` before and after
+  and show the real numbers in the PR.
+- **A faster AVX2 rotate for `hash_many`'s batching.** AVX2×4 batching
+  (`src/simd_parallel.rs`) measures only ~1.2x over a scalar loop versus
+  AVX-512×8's ~5.5x (README §5.1), because AVX2 has no 64-bit rotate
+  instruction — ρ is emulated as shift-left + shift-right + or. If
+  there's a cheaper way to get a per-lane rotate out of AVX2 (or a
+  restructuring that reduces the instruction count elsewhere to
+  compensate), that's a real, benchmarkable win.
+- **A NEON (AArch64) path**, for either `hash()` or `hash_many` — there
+  is no non-x86 SIMD path at all today (README §8.2).
 - Additional test vectors, edge cases, or fuzzing coverage.
 - `no_std`/kernel-mode correctness fixes and cross-platform testing.
 - Documentation and example fixes — including catching claims that

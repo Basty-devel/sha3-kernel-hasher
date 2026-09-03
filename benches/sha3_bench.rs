@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use sha3_kernel_hasher::{Sha3_512Kernel, PerformanceConfig};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use sha3_kernel_hasher::{PerformanceConfig, Sha3_512Kernel};
 
 fn bench_hash_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("sha3_512_hash");
@@ -8,53 +8,37 @@ fn bench_hash_sizes(c: &mut Criterion) {
         let data = vec![0xABu8; size];
         group.throughput(Throughput::Bytes(size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("scalar", size),
-            &data,
-            |b, data| {
-                let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
-                    use_avx512: false,
-                    use_avx2: false,
-                    ..Default::default()
-                });
-                b.iter(|| black_box(hasher.hash(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("scalar", size), &data, |b, data| {
+            let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+                use_avx512: false,
+                use_avx2: false,
+                ..Default::default()
+            });
+            b.iter(|| black_box(hasher.hash(data)));
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("avx2", size),
-            &data,
-            |b, data| {
-                let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
-                    use_avx512: false,
-                    use_avx2: true,
-                    ..Default::default()
-                });
-                b.iter(|| black_box(hasher.hash(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("avx2", size), &data, |b, data| {
+            let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+                use_avx512: false,
+                use_avx2: true,
+                ..Default::default()
+            });
+            b.iter(|| black_box(hasher.hash(data)));
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("avx512", size),
-            &data,
-            |b, data| {
-                let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
-                    use_avx512: true,
-                    use_avx2: true,
-                    ..Default::default()
-                });
-                b.iter(|| black_box(hasher.hash(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("avx512", size), &data, |b, data| {
+            let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+                use_avx512: true,
+                use_avx2: true,
+                ..Default::default()
+            });
+            b.iter(|| black_box(hasher.hash(data)));
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("auto", size),
-            &data,
-            |b, data| {
-                let mut hasher = Sha3_512Kernel::new();
-                b.iter(|| black_box(hasher.hash(data)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("auto", size), &data, |b, data| {
+            let mut hasher = Sha3_512Kernel::new();
+            b.iter(|| black_box(hasher.hash(data)));
+        });
     }
 
     group.finish();
@@ -104,5 +88,51 @@ fn bench_throughput_1mb(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_hash_sizes, bench_incremental, bench_throughput_1mb);
+fn bench_hash_many(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sha3_512_hash_many");
+    // 64 independent 4 KiB messages: representative of batch workloads
+    // (hashing many files/records at once) where hash_many's SIMD
+    // batching has real independent work to parallelize, unlike a
+    // single large message.
+    let messages: Vec<Vec<u8>> = (0..64).map(|i| vec![(i & 0xFF) as u8; 4096]).collect();
+    let refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+    group.throughput(Throughput::Bytes((messages.len() * 4096) as u64));
+
+    group.bench_function("64x4KiB_avx512", |b| {
+        let hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: true,
+            use_avx2: false,
+            ..Default::default()
+        });
+        b.iter(|| black_box(hasher.hash_many(&refs)));
+    });
+
+    group.bench_function("64x4KiB_avx2", |b| {
+        let hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: false,
+            use_avx2: true,
+            ..Default::default()
+        });
+        b.iter(|| black_box(hasher.hash_many(&refs)));
+    });
+
+    group.bench_function("64x4KiB_scalar_loop", |b| {
+        let hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+            use_avx512: false,
+            use_avx2: false,
+            ..Default::default()
+        });
+        b.iter(|| black_box(hasher.hash_many(&refs)));
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_hash_sizes,
+    bench_incremental,
+    bench_throughput_1mb,
+    bench_hash_many
+);
 criterion_main!(benches);

@@ -1,4 +1,4 @@
-# SHA3-Kernel-Hasher 0.2.0
+# SHA3-Kernel-Hasher 0.3.0
 
 A pure-Rust SHA3-512 (FIPS 202) implementation, dual-mode: standard `std`
 for userspace, `no_std` + `alloc` for Windows kernel-mode drivers.
@@ -15,9 +15,14 @@ for userspace, `no_std` + `alloc` for Windows kernel-mode drivers.
   implementation, and none is claimed.
 - **Cross-validated against RustCrypto's `sha3` crate** (v0.10) across 20
   input lengths.
-- **36 passing tests**, including constant-time-comparison correctness,
-  incremental-vs-one-shot equivalence, and boundary conditions
-  (empty input, exact-rate-block, rate+1).
+- **New in 0.3.0: `hash_many()`** — batch hashing of independent
+  messages with a real AVX-512×8 SIMD path (~5.5x over a scalar loop;
+  see below). Handles variable-length messages within one batch.
+- **65 passing tests** (57 unit + 8 doc), including
+  constant-time-comparison correctness, incremental-vs-one-shot
+  equivalence, boundary conditions (empty input, exact-rate-block,
+  rate+1), and bit-for-bit cross-validation of every SIMD path against
+  the scalar implementation.
 - **Constant-time digest comparison** (`ct::ct_eq`) — accumulator-based
   XOR over the full length, no early-exit branch, following Bernstein,
   Lange & Schwabe (2012).
@@ -33,20 +38,26 @@ for userspace, `no_std` + `alloc` for Windows kernel-mode drivers.
 
 Being direct about this because the crate's own earlier docs weren't:
 
-- **No SIMD acceleration exists yet.** The crate detects AVX-512F/BW/DQ,
-  AVX2+BMI2, and SSE4.2 at runtime (`is_x86_feature_detected!`) and
-  exposes that via `simd_features()`, but nothing in the hashing code
-  path consumes it — `hash()` always runs the same scalar
-  Keccak-f[1600] implementation. Measured: ~150-190 MiB/s across payload
-  sizes from 64 B to 1 MiB on a CPU that reports AVX-512 and AVX2 both
-  available (`cargo run --release --example benchmark` to reproduce on
-  your own hardware). This crate's own criterion benchmark
-  (`sha3_512_throughput/1MB_auto` vs. `1MB_scalar`) measures the same
-  throughput either way, because both run identical code. That's a
-  competent scalar implementation — not a hardware-accelerated one.
+- **Single-message SIMD (`hash()`) is real but not a speedup.** The
+  crate detects AVX-512F/BW/DQ, AVX2+BMI2, and SSE4.2 at runtime
+  (`is_x86_feature_detected!`, exposed via `simd_features()`), and
+  `PerformanceConfig::use_avx512` genuinely dispatches to a real,
+  cross-validated AVX-512 Keccak-f[1600] permutation — this is not a
+  stub. It measures ~3-4% *slower* than scalar at 1 MiB, though, because
+  a single hash has no independent lanes for a wide register to exploit.
+  It defaults to `false` for exactly that reason. See README §5.1 for
+  the numbers, or `cargo bench --bench sha3_bench sha3_512_throughput`
+  to reproduce on your own hardware.
+- **Batch SIMD (`hash_many()`) is a real, substantial speedup.** Hashing
+  a batch of independent messages via `PerformanceConfig::use_avx512`
+  dispatches to an AVX-512×8 batched permutation measuring ~5.5x over a
+  scalar loop (64 independent 4 KiB messages, this container's Xeon);
+  `use_avx2` gives a more modest ~1.2x via AVX2×4 (AVX2 has no 64-bit
+  rotate instruction). See README §5.1 or
+  `cargo bench --bench sha3_bench sha3_512_hash_many` to reproduce.
 - **No external security audit has been performed.** No cryptography
-  firm, no peer review, no CVE history (there's no history at all — this
-  is a first release). Treat it as unaudited until stated otherwise.
+  firm, no peer review, no CVE history. Treat it as unaudited until
+  stated otherwise.
 - **No formal compliance certification.** Not FIPS 140 validated, not
   Common Criteria evaluated, no CNSA 2.0 endorsement. "Passes NIST's
   published test vectors" and "government-certified" are different
@@ -64,17 +75,18 @@ Being direct about this because the crate's own earlier docs weren't:
 ## Verification
 
 ```bash
-curl -O https://crates.io/api/v1/crates/sha3-kernel-hasher/0.2.0/download
-curl -O https://github.com/Basty-devel/sha3-kernel-hasher/releases/download/v0.2.0/sha3-kernel-hasher-0.2.0.tar.gz.asc
+curl -O https://crates.io/api/v1/crates/sha3-kernel-hasher/0.3.0/download
+curl -O https://github.com/Basty-devel/sha3-kernel-hasher/releases/download/v0.3.0/sha3-kernel-hasher-0.3.0.tar.gz.asc
 gpg --import PUBLIC_KEY.asc
-gpg --verify sha3-kernel-hasher-0.2.0.tar.gz.asc download
+gpg --verify sha3-kernel-hasher-0.3.0.tar.gz.asc download
 ```
 
 ## What's next
 
-Real SIMD-widened permutation (the honest reason `avx2`/`avx512` exist as
-`PerformanceConfig` fields at all) is the open item that would make the
-performance side of this crate's name accurate. Until that lands, this is
-a correct, tested, dual-mode scalar SHA3-512 — which is a real, useful
-thing on its own, just not the thing the earlier draft of this
-announcement claimed.
+Closing the single-message AVX-512 gap (currently a small net loss, not
+a win) and a faster AVX2 rotate for batch hashing (currently only ~1.2x,
+versus AVX-512×8's ~5.5x) are the open performance items — see
+CONTRIBUTING.md. A NEON (AArch64) path doesn't exist at all yet. None of
+that changes the core correctness story: this is a correct, tested,
+dual-mode SHA3-512 with a genuinely accelerated batch-hashing path where
+it matters most.

@@ -18,7 +18,7 @@ pub const KECCAK_ROUNDS: usize = 24;
 ///
 /// Derived from the LFSR-based generation rule in FIPS 202, §3.2.5.
 /// Each constant is applied to lane (0,0) after the χ step.
-const RC: [u64; KECCAK_ROUNDS] = [
+pub(crate) const RC: [u64; KECCAK_ROUNDS] = [
     0x0000_0000_0000_0001,
     0x0000_0000_0000_8082,
     0x8000_0000_0000_808A,
@@ -50,12 +50,8 @@ const RC: [u64; KECCAK_ROUNDS] = [
 /// These are the lane-specific rotation amounts defined in FIPS 202, §3.2.2.
 /// Lane (0,0) has offset 0; all others are computed from the recurrence
 /// relation (t+1)(t+2)/2 mod 64.
-const RHO: [u32; 25] = [
-     0,  1, 62, 28, 27,
-    36, 44,  6, 55, 20,
-     3, 10, 43, 25, 39,
-    41, 45, 15, 21,  8,
-    18,  2, 61, 56, 14,
+pub(crate) const RHO: [u32; 25] = [
+    0, 1, 62, 28, 27, 36, 44, 6, 55, 20, 3, 10, 43, 25, 39, 41, 45, 15, 21, 8, 18, 2, 61, 56, 14,
 ];
 
 /// The π (pi) step source indices: `new[i] = old[PI[i]]` after ρ rotation.
@@ -64,13 +60,22 @@ const RHO: [u32; 25] = [
 /// index `x' + 5*y'` where `x' = y, y' = (2*x + 3*y) mod 5` (inverted).
 ///
 /// Pre-computed lookup avoids modular arithmetic in the hot loop.
-const PI: [usize; 25] = [
-     0, 6, 12, 18, 24,
-     3, 9, 10, 16, 22,
-     1, 7, 13, 19, 20,
-     4, 5, 11, 17, 23,
-     2, 8, 14, 15, 21,
+pub(crate) const PI: [usize; 25] = [
+    0, 6, 12, 18, 24, 3, 9, 10, 16, 22, 1, 7, 13, 19, 20, 4, 5, 11, 17, 23, 2, 8, 14, 15, 21,
 ];
+
+/// Returns the ι-step round constants, in round order.
+///
+/// Exposed for the AVX-512 kernel (`simd_avx512.rs`), which re-derives its
+/// own copy from this value in `tests::table_consistency` rather than
+/// trusting a hand-transcribed duplicate. Gated identically to that
+/// module (see `lib.rs`) so it isn't flagged as dead code in builds where
+/// `simd_avx512` itself is excluded (`kernel`/non-x86_64).
+#[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+#[inline]
+pub(crate) const fn round_constants() -> [u64; KECCAK_ROUNDS] {
+    RC
+}
 
 /// Apply the full Keccak-f[1600] permutation in-place.
 ///
@@ -105,11 +110,31 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         let d3 = c2 ^ c4.rotate_left(1);
         let d4 = c3 ^ c0.rotate_left(1);
 
-        state[0]  ^= d0; state[5]  ^= d0; state[10] ^= d0; state[15] ^= d0; state[20] ^= d0;
-        state[1]  ^= d1; state[6]  ^= d1; state[11] ^= d1; state[16] ^= d1; state[21] ^= d1;
-        state[2]  ^= d2; state[7]  ^= d2; state[12] ^= d2; state[17] ^= d2; state[22] ^= d2;
-        state[3]  ^= d3; state[8]  ^= d3; state[13] ^= d3; state[18] ^= d3; state[23] ^= d3;
-        state[4]  ^= d4; state[9]  ^= d4; state[14] ^= d4; state[19] ^= d4; state[24] ^= d4;
+        state[0] ^= d0;
+        state[5] ^= d0;
+        state[10] ^= d0;
+        state[15] ^= d0;
+        state[20] ^= d0;
+        state[1] ^= d1;
+        state[6] ^= d1;
+        state[11] ^= d1;
+        state[16] ^= d1;
+        state[21] ^= d1;
+        state[2] ^= d2;
+        state[7] ^= d2;
+        state[12] ^= d2;
+        state[17] ^= d2;
+        state[22] ^= d2;
+        state[3] ^= d3;
+        state[8] ^= d3;
+        state[13] ^= d3;
+        state[18] ^= d3;
+        state[23] ^= d3;
+        state[4] ^= d4;
+        state[9] ^= d4;
+        state[14] ^= d4;
+        state[19] ^= d4;
+        state[24] ^= d4;
 
         // ===== ρ (rho) + π (pi) steps (fused) =====
         // Rotate each lane by its ρ offset, then permute via π lookup.
@@ -122,11 +147,11 @@ pub fn keccak_f1600(state: &mut [u64; 25]) {
         // Non-linear mixing: each bit depends on two neighbours in the row.
         for y in 0..5 {
             let base = 5 * y;
-            state[base]     = b[base]     ^ ((!b[base + 1]) & b[base + 2]);
+            state[base] = b[base] ^ ((!b[base + 1]) & b[base + 2]);
             state[base + 1] = b[base + 1] ^ ((!b[base + 2]) & b[base + 3]);
             state[base + 2] = b[base + 2] ^ ((!b[base + 3]) & b[base + 4]);
             state[base + 3] = b[base + 3] ^ ((!b[base + 4]) & b[base]);
-            state[base + 4] = b[base + 4] ^ ((!b[base])     & b[base + 1]);
+            state[base + 4] = b[base + 4] ^ ((!b[base]) & b[base + 1]);
         }
 
         // ===== ι (iota) step =====
@@ -198,28 +223,23 @@ mod tests {
         // Lane 0 after one permutation of zero state
         // Reference: XKCP KeccakF-1600-IntermediateValues.txt
         assert_eq!(
-            state[0],
-            0xF1258F7940E1DDE7,
+            state[0], 0xF1258F7940E1DDE7,
             "Lane 0 must match XKCP reference"
         );
         assert_eq!(
-            state[1],
-            0x84D5CCF933C0478A,
+            state[1], 0x84D5CCF933C0478A,
             "Lane 1 must match XKCP reference"
         );
         assert_eq!(
-            state[2],
-            0xD598261EA65AA9EE,
+            state[2], 0xD598261EA65AA9EE,
             "Lane 2 must match XKCP reference"
         );
         assert_eq!(
-            state[3],
-            0xBD1547306F80494D,
+            state[3], 0xBD1547306F80494D,
             "Lane 3 must match XKCP reference"
         );
         assert_eq!(
-            state[4],
-            0x8B284E056253D057,
+            state[4], 0x8B284E056253D057,
             "Lane 4 must match XKCP reference"
         );
     }
