@@ -505,7 +505,55 @@ cargo run --example benchmark --release -p sha3-kernel-hasher
 ```
 
 ---
-
+### 8.4 Where `hash_many` Batching Actually Helps
++
++Every use case below is framed around what `hash_many` really does: take
++*N* independent, already-available messages and return *N* digests
++faster than *N* sequential `hash()` calls (§5.1). It is not a general
++"SHA-3 is now fast" claim — the single-hash path is not a speedup
++(§5.1) — and it only pays off when a workload actually produces
++batches of independent messages up front, not one message at a time.
++
+**Legitimate today** — batch shape matches `hash_many`'s signature
++(`&[&[u8]] -> Vec<Sha3Digest>`) directly:
++
++- **Merkle / sparse Merkle tree construction** — hashing a tree's
++  leaves (and same-level internal nodes) is embarrassingly parallel;
++  feed a level's nodes into one `hash_many` call.
++- **Storage deduplication engines** — chunking a file or stream into
++  content-defined blocks and digesting many blocks at once.
++- **Multi-part upload / chunk validation** — S3-style multipart
++  uploads, IPFS block hashing: each part's digest is independent of
++  the others.
++- **CI/CD asset checksumming** — batch-hashing many build artifacts
++  (textures, meshes, compiled shaders) in one pipeline stage.
++- **Columnar / ETL batch hashing** — Arrow/Polars-style record
++  batches where the same hash operation applies independently across
++  many rows; wire a column's values into `&[&[u8]]` per batch.
++
++Every one of these inherits the measured §5.1 numbers — **~5.5x**,
++**~1004 MiB/s** — for a batch of 64 independent 4 KiB messages on
++this container's Xeon with AVX-512. Your batch size, message size,
++and CPU generation change that number; benchmark your own workload
++(§8.3) before relying on it.
++
++**Not a fit for this crate as it stands today** — common claims that
++don't survive contact with what's actually implemented:
++
++| Claim | Problem |
++|-------|---------|
++| Ethereum / L1/L2 mempool or ZK-rollup Merkle roots | Most chains marketed as "SHA-3" actually use **Keccak-256** (the original Keccak submission's `0x01` padding), not **NIST FIPS 202 SHA3-256/512** (`0x06` domain-separated padding — what this crate implements, §1.1). Same algorithm family, different digests for the same input. Verify which one your target chain actually specifies. |
++| SPHINCS+ / XMSS signature hashing | Most standardized parameter sets use SHA-256 or **SHAKE256** (an extendable-output function) — this crate implements fixed-output SHA3-512 only, no XOF mode. Even where a parameter set does use SHA3-512, WOTS+ chains and internal Merkle nodes are sequentially dependent; only leaf-level hashing is actually "independent messages" that `hash_many` can batch. |
++| Kernel integrity — IMA/EVM, dm-verity | Those are **Linux** kernel subsystems. This crate's `kernel` feature targets **Windows** kernel-mode drivers only (WDM/KMDF, `KeSaveExtendedProcessorState`, §2.2). No Linux kernel-module path exists here. |
++| DPI/NIDS at "10GbE/100GbE line rate" | 100GbE ≈ 12.5 GiB/s; the measured ceiling here is ~1004 MiB/s (~8 Gbit/s) under a favorable synthetic batch — roughly an order of magnitude short of 100GbE, and not comfortably past 10GbE either. Don't cite line-rate numbers this crate hasn't been benchmarked against. |
++| "SHA-3 becomes I/O-bound" (general) | §5.1 already shows the opposite for single-hash calls: AVX-512 measured **3-4% slower** than scalar. Only the batch path clears that bar, and only for genuinely independent-message workloads sized like the benchmark above. |
++
++If your workload doesn't naturally produce a batch of independent
++messages up front — one HTTP request at a time, one token
++verification at a time — `hash_many` has nothing to batch, and you're
++back on the scalar §5.1 numbers regardless of core count.
++
+ ---
 ## 9. Publishing to crates.io
 
 Yes, this crate can be published to [crates.io](https://crates.io).
