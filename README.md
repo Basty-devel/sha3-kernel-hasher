@@ -275,14 +275,14 @@ Simple wall-clock throughput measurement for integration testing.
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = "0.4.0"
+sha3-kernel-hasher = "0.4.1"
 ```
 
 For kernel drivers:
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = { version = "0.4.0", default-features = false, features = ["kernel"] }
+sha3-kernel-hasher = { version = "0.4.1", default-features = false, features = ["kernel"] }
 ```
 
 ### 4.2 Minimum Supported Rust Version (MSRV)
