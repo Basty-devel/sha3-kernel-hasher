@@ -2,7 +2,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/sha3-kernel-hasher.svg)](https://crates.io/crates/sha3-kernel-hasher)
 [![docs.rs](https://docs.rs/sha3-kernel-hasher/badge.svg)](https://docs.rs/sha3-kernel-hasher)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+[![License](https://img.shields.io/badge/license-PolyForm--Noncommercial--1.0.0-blue.svg)](LICENSE)
 [![NIST CAVP](https://img.shields.io/badge/NIST_CAVP-validated-brightgreen.svg)](#71-nist-cavp-test-vectors)
 
 > **Production-grade SHA3-512 (FIPS 202) implementation in pure Rust with
@@ -275,14 +275,14 @@ Simple wall-clock throughput measurement for integration testing.
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = "0.3.0"
+sha3-kernel-hasher = "0.4.0"
 ```
 
 For kernel drivers:
 
 ```toml
 [dependencies]
-sha3-kernel-hasher = { version = "0.3.0", default-features = false, features = ["kernel"] }
+sha3-kernel-hasher = { version = "0.4.0", default-features = false, features = ["kernel"] }
 ```
 
 ### 4.2 Minimum Supported Rust Version (MSRV)
@@ -576,7 +576,7 @@ cargo publish -p sha3-kernel-hasher
 Before publishing, verify the following in `Cargo.toml`:
 - `name` — Must be unique on crates.io
 - `version` — Follow SemVer (Semantic Versioning 2.0.0; Preston-Werner, 2013)
-- `license` — Dual MIT/Apache-2.0 is standard for the Rust ecosystem
+- `license` — Must match the SPDX identifier of `LICENSE` exactly
 - `repository` — Points to the canonical source repository
 - `description` — Concise summary (< 200 characters)
 - `readme` — Points to this file
@@ -609,12 +609,15 @@ using the PGP key in [PUBLIC_KEY.asc](PUBLIC_KEY.asc).
 
 ## 11. Licence
 
-Dual-licensed under:
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE).
+Any noncommercial use — personal, research, educational, or by a
+noncommercial organization — is permitted. Commercial use requires a
+separate license from the copyright holder; contact
+**sebastian.nestler@tutanota.de**.
 
-- **MIT** — [LICENSE-MIT](LICENSE-MIT)
-- **Apache 2.0** — [LICENSE-APACHE](LICENSE-APACHE)
-
-at your option.
+Versions up to and including 0.3.x remain available under the original
+MIT/Apache-2.0 dual license under which they were published; this
+relicense applies to 0.4.0 and later.
 
 ---
 

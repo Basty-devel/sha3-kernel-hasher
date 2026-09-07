@@ -1,11 +1,11 @@
 [package]
 name = "sha3-kernel-hasher"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Sebastian Friedrich Nestler <sebastian.nestler@tutanota.de>"]
 description = "Pure-Rust SHA3-512 (FIPS 202), full Keccak-f[1600] permutation, no_std+alloc dual-mode for kernel drivers. Passes NIST CAVP test vectors, cross-validated vs RustCrypto sha3. Real AVX-512x8 batch hashing (~5.5x, hash_many); single-hash SIMD is opt-in, not a speedup — see README 5.1."
-license = "MIT OR Apache-2.0"
+license = "PolyForm-Noncommercial-1.0.0"
 repository = "https://github.com/Basty-devel/sha3-kernel-hasher"
 homepage = "https://github.com/Basty-devel/sha3-kernel-hasher"
 documentation = "https://docs.rs/sha3-kernel-hasher"

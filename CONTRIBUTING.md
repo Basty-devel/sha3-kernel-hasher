@@ -96,7 +96,7 @@ Please allow a reasonable window for a fix before public disclosure.
 ## License
 
 By contributing, you agree your contributions are licensed under the same
-terms as the project (MIT OR Apache-2.0).
+terms as the project (PolyForm Noncommercial License 1.0.0).
 
 ## Resources
 
