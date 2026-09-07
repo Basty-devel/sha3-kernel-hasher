@@ -83,6 +83,15 @@ pub fn ct_hash_eq(a: &[u8; 64], b: &[u8; 64]) -> bool {
 /// Returns `a` if `condition` is `true`, otherwise `b`.  Both branches
 /// are always evaluated; the selection is performed with bitwise
 /// operations to avoid branch prediction leakage.
+///
+/// # Examples
+///
+/// ```
+/// use sha3_kernel_hasher::ct::ct_select;
+///
+/// assert_eq!(ct_select(true, 0xAA, 0xBB), 0xAA);
+/// assert_eq!(ct_select(false, 0xAA, 0xBB), 0xBB);
+/// ```
 #[inline]
 pub fn ct_select(condition: bool, a: u8, b: u8) -> u8 {
     let mask = (condition as u8).wrapping_neg(); // 0xFF if true, 0x00 if false

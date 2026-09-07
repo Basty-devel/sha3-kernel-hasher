@@ -157,6 +157,7 @@
 //!   LNCS 1109, pp. 104–113.
 
 #![cfg_attr(feature = "kernel", no_std)]
+#![warn(missing_docs)]
 
 #[cfg(feature = "kernel")]
 extern crate alloc;
@@ -256,12 +257,24 @@ pub struct Sha3_512Kernel {
     config: PerformanceConfig,
 }
 
-/// SIMD feature detection results
+/// SIMD feature detection results, as probed once via
+/// `is_x86_feature_detected!` and returned by
+/// [`Sha3_512Kernel::simd_features`].
 #[derive(Debug, Clone, Copy)]
 pub struct SimdFeatures {
+    /// Whether the running CPU supports AVX-512F/BW/DQ. Gates both the
+    /// single-message AVX-512 permutation and the AVX-512×8 batch path.
     pub avx512_available: bool,
+    /// Whether the running CPU supports AVX2 + BMI2. Gates the AVX2×4
+    /// batch path used by `Sha3_512Kernel::hash_many` (`std` +
+    /// `x86_64` builds only — not an intra-doc link here since the
+    /// method doesn't exist under `kernel`/non-x86_64 builds).
     pub avx2_available: bool,
+    /// Whether the running CPU supports SSE4.2. Currently detected but
+    /// not dispatched to by any permutation path.
     pub sse42_available: bool,
+    /// Whether the running CPU supports BMI2 (`RORX`/`SHRX` etc.),
+    /// required alongside AVX2 for the AVX2×4 batch path.
     pub bmi2_available: bool,
 }
 
@@ -449,14 +462,30 @@ mod state_serde {
 /// Hash result type — 64 bytes (512 bits)
 pub type Sha3_512Hash = [u8; 64];
 
-/// Memory region descriptor for kernel hashing
+/// Memory region descriptor for kernel hashing.
+///
+/// Passed to [`Sha3_512Kernel::hash_memory_regions`], which hashes each
+/// region for which `is_readable` is `true` and `size` is a nonzero value
+/// not exceeding [`MAX_HASH_SIZE`], skipping the rest. The caller is
+/// responsible for the region actually being valid, mapped memory at
+/// `base_address` for `size` bytes — see [`kernel_safe`] and
+/// [`Sha3_512Kernel::hash_memory_region`] for the `unsafe` contract this
+/// descriptor feeds into.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct MemoryRegion {
+    /// Starting virtual address of the region.
     pub base_address: u64,
+    /// Length of the region in bytes.
     pub size: usize,
+    /// Whether the region is safe to read. Regions with `is_readable ==
+    /// false` are skipped by [`Sha3_512Kernel::hash_memory_regions`].
     pub is_readable: bool,
+    /// Whether the region is writable. Informational only — not
+    /// consulted by the hashing path, which only reads.
     pub is_writable: bool,
+    /// Whether the region is executable. Informational only — not
+    /// consulted by the hashing path, which only reads.
     pub is_executable: bool,
 }
 
@@ -473,6 +502,19 @@ impl Sha3_512Kernel {
     }
 
     /// Create a hasher with a custom performance configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sha3_kernel_hasher::{PerformanceConfig, Sha3_512Kernel};
+    ///
+    /// let mut hasher = Sha3_512Kernel::with_config(PerformanceConfig {
+    ///     use_avx2: true,
+    ///     ..Default::default()
+    /// });
+    /// let digest = hasher.hash(b"hello");
+    /// assert_eq!(digest.len(), 64);
+    /// ```
     pub fn with_config(config: PerformanceConfig) -> Self {
         let features = Self::detect_simd_features();
         Self {
@@ -504,6 +546,17 @@ impl Sha3_512Kernel {
     /// The caller must guarantee that `[base_address, base_address + size)`
     /// is a valid, readable memory region for the lifetime of this call.
     /// Returns `[0u8; 64]` if `size` is zero or exceeds `MAX_HASH_SIZE`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sha3_kernel_hasher::Sha3_512Kernel;
+    ///
+    /// let buffer = vec![0xABu8; 4096];
+    /// let mut hasher = Sha3_512Kernel::new();
+    /// let digest = hasher.hash_memory_region(buffer.as_ptr() as u64, buffer.len());
+    /// assert_eq!(digest, hasher.hash(&buffer));
+    /// ```
     pub fn hash_memory_region(&mut self, base_address: u64, size: usize) -> Sha3_512Hash {
         if size == 0 || size > MAX_HASH_SIZE {
             return [0u8; 64];
@@ -548,6 +601,20 @@ impl Sha3_512Kernel {
     /// have blocks left. See `hash_batch` below for the algorithm.
     ///
     /// Returns one digest per input message, in the same order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
+    /// # {
+    /// use sha3_kernel_hasher::Sha3_512Kernel;
+    ///
+    /// let hasher = Sha3_512Kernel::new();
+    /// let messages: [&[u8]; 3] = [b"first", b"second", b"third"];
+    /// let digests = hasher.hash_many(&messages);
+    /// assert_eq!(digests.len(), 3);
+    /// # }
+    /// ```
     #[cfg(all(not(feature = "kernel"), target_arch = "x86_64"))]
     pub fn hash_many(&self, messages: &[&[u8]]) -> Vec<Sha3_512Hash> {
         let width = if self.config.use_avx512 && is_x86_feature_detected!("avx512f") {
@@ -598,17 +665,40 @@ impl Sha3_512Kernel {
         }
     }
 
-    /// Get current SIMD features
+    /// Get the SIMD features detected on the current CPU at construction
+    /// time (see [`SimdFeatures`] for what each flag gates).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sha3_kernel_hasher::Sha3_512Kernel;
+    ///
+    /// let hasher = Sha3_512Kernel::new();
+    /// let features = hasher.simd_features();
+    /// println!("AVX-512 available: {}", features.avx512_available);
+    /// ```
     pub fn simd_features(&self) -> SimdFeatures {
         self.features
     }
 
-    /// Get current configuration
+    /// Get the hasher's current [`PerformanceConfig`].
     pub fn config(&self) -> PerformanceConfig {
         self.config
     }
 
-    /// Update configuration
+    /// Replace the hasher's [`PerformanceConfig`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use sha3_kernel_hasher::{PerformanceConfig, Sha3_512Kernel};
+    ///
+    /// let mut hasher = Sha3_512Kernel::new();
+    /// hasher.update_config(PerformanceConfig {
+    ///     use_avx2: true,
+    ///     ..hasher.config()
+    /// });
+    /// ```
     pub fn update_config(&mut self, config: PerformanceConfig) {
         self.config = config;
     }
@@ -1526,7 +1616,18 @@ mod tests {
     }
 }
 
+/// Criterion benchmark harness for `cargo bench --features benchmarks`.
+///
+/// Not part of the crate's stable public API — it exists so
+/// `cargo bench` can find a `main` entry point, and is only compiled
+/// when the `benchmarks` feature is enabled. See the "Performance"
+/// section of the crate-level docs for the throughput numbers this
+/// harness produces.
+///
+/// `main` below is generated by the `criterion_main!` macro and can't
+/// carry its own doc comment, hence the module-level `allow`.
 #[cfg(feature = "benchmarks")]
+#[allow(missing_docs)]
 pub mod benchmarks {
     use super::*;
     #[cfg(feature = "kernel")]
