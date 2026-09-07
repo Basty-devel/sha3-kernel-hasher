@@ -615,10 +615,6 @@ noncommercial organization — is permitted. Commercial use requires a
 separate license from the copyright holder; contact
 **sebastian.nestler@tutanota.de**.
 
-Versions up to and including 0.3.x remain available under the original
-MIT/Apache-2.0 dual license under which they were published; this
-relicense applies to 0.4.0 and later.
-
 ---
 
 ## 12. References
